@@ -2,21 +2,90 @@ name: Rust
 
 on:
   push:
-    branches: [ "master" ]
+    branches: ["master"]
+    tags: ["v*"]
   pull_request:
-    branches: [ "master" ]
+    branches: ["master"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  TARGET: x86_64-pc-windows-gnu
 
 jobs:
-  build:
-
+  test:
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  build:
+    # Cross-compiles from Linux with mingw: the exe is fully standalone (no MSVC runtime).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - run: cargo clippy --locked --release --target $TARGET -- -D warnings
+      - run: cargo build --locked --release --target $TARGET
+      - name: Collect binary
+        run: |
+          mkdir dist
+          cp target/$TARGET/release/ntfy-toast.exe dist/
+          cd dist && sha256sum ntfy-toast.exe > ntfy-toast.exe.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ntfy-toast-windows-x64
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches Cargo.toml version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: ntfy-toast-windows-x64
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/ntfy-toast.exe dist/ntfy-toast.exe.sha256 \
+            --title "ntfy-toast $GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes "$(cat <<'EOF'
+          ## Install
+
+          1. Download `ntfy-toast.exe` below and move it somewhere permanent, e.g. `%LOCALAPPDATA%\Programs\ntfy-toast\`.
+          2. Run `ntfy-toast.exe init`, then edit `%APPDATA%\ntfy-toast\config.toml` to set your topics.
+          3. Run `ntfy-toast.exe install` to start it now and at every login.
+
+          The exe isn't code-signed, so Windows SmartScreen may warn on first run: choose **More info → Run anyway**.
+          Verify the download with `ntfy-toast.exe.sha256` (`Get-FileHash ntfy-toast.exe`).
+          EOF
+          )"
