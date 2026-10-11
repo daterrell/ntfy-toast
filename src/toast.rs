@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Windows refuses toast images larger than this.
 const MAX_IMAGE_BYTES: u64 = 3 * 1024 * 1024;
@@ -271,17 +271,27 @@ pub fn prune_cache() {
     }
 }
 
+/// The live config, swapped on reload; readers clone the inner `Arc` and drop the lock.
+pub type SharedConfig = Arc<RwLock<Arc<Config>>>;
+
 /// Toast thread: owns the WinRT notifier and displays notices as they arrive.
-pub fn run(rx: Receiver<Notice>, cfg: Arc<Config>) {
-    let notifier = match platform::Notifier::new(&cfg.app_id) {
-        Ok(n) => n,
-        Err(e) => {
-            log::error!("cannot create toast notifier: {e:#}");
-            return;
-        }
-    };
+pub fn run(rx: Receiver<Notice>, shared: SharedConfig) {
     let agent = crate::subscriber::agent();
+    let mut notifier: Option<(String, platform::Notifier)> = None;
     for n in rx {
+        let cfg = shared.read().unwrap().clone();
+        if notifier.as_ref().is_none_or(|(id, _)| *id != cfg.app_id) {
+            match platform::Notifier::new(&cfg.app_id) {
+                Ok(x) => notifier = Some((cfg.app_id.clone(), x)),
+                Err(e) => {
+                    log::error!("cannot create toast notifier: {e:#}");
+                    continue;
+                }
+            }
+        }
+        let Some((_, notifier)) = &notifier else {
+            continue;
+        };
         let toast = prepare(&agent, &n, &cfg);
         if let Err(e) = notifier.show(&toast, &toast.xml) {
             warn!("toast rejected ({e:#}); retrying without extras");

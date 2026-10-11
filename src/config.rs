@@ -4,6 +4,8 @@ use std::path::Path;
 
 pub const SAMPLE: &str = r#"# ntfy-toast configuration
 #
+# Changes are picked up automatically while ntfy-toast is running.
+#
 # Server used by subscriptions that don't set their own `server`.
 default_server = "https://ntfy.sh"
 
@@ -29,7 +31,7 @@ topic = "change-me-to-your-topic"
 # name = "Home server"                         # shown as the attribution line
 "#;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_server")]
@@ -46,7 +48,7 @@ pub struct Config {
     pub subscriptions: Vec<Subscription>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Subscription {
     pub topic: Option<String>,

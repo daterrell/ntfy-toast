@@ -9,6 +9,7 @@ and shows each message as a native Windows toast notification.
 - Survives network drops and sleep: reconnects with backoff and resumes from the last
   message seen, so nothing is missed
 - Optionally catches up on messages published while it wasn't running
+- Picks up config edits live, with no restart needed
 
 ## Quick start
 
@@ -62,7 +63,11 @@ min_priority = 3
 name = "Home server"           # attribution line on the toast
 ```
 
-Changes to the config take effect after a restart.
+Changes to the config are applied automatically while the daemon runs (it checks every
+2 seconds). Only subscriptions whose settings changed are reconnected; ones that were
+already running resume from the last message seen, so nothing is missed during a reload.
+If an edit has a mistake, a notification shows the error and the previous settings
+stay in effect until the file is fixed.
 
 ## How ntfy features map to toasts
 

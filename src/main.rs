@@ -2,6 +2,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod config;
+mod daemon;
 mod message;
 mod paths;
 mod subscriber;
@@ -11,10 +12,10 @@ mod toast;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::Config;
-use log::{error, info, LevelFilter};
+use log::{error, LevelFilter};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::Mutex;
 
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
@@ -35,7 +36,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the daemon (the default when no command is given)
+    /// Run the daemon (the default when no command is given); config edits apply live
     Run,
     /// Write a sample config file
     Init {
@@ -183,67 +184,6 @@ fn show_direct(cfg: &Config, title: &str, message: &str, priority: u8, topic: &s
     toast::platform::Notifier::new(&cfg.app_id)?.show(&t, &t.xml)
 }
 
-fn run_daemon(config_path: PathBuf) -> Result<()> {
-    if !system::acquire_single_instance() {
-        info!("already running; exiting");
-        return Ok(());
-    }
-    info!("ntfy-toast {} starting", env!("CARGO_PKG_VERSION"));
-
-    if write_sample_config(&config_path, false)? {
-        info!("created sample config at {}", config_path.display());
-    }
-    let cfg = match Config::load(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            // Without a usable config there is nothing to do, but say so visibly.
-            error!("{e:#}");
-            let fallback = Config::parse(config::SAMPLE)?;
-            register(&fallback.app_id, &fallback.app_display_name);
-            let _ = show_direct(
-                &fallback,
-                "ntfy-toast: config problem",
-                &format!("{e:#}\n\nEdit {} and restart.", config_path.display()),
-                4,
-                "ntfy-toast",
-            );
-            return Err(e);
-        }
-    };
-    if cfg
-        .subscriptions
-        .iter()
-        .any(|s| s.all_topics().iter().any(|t| t == "change-me-to-your-topic"))
-    {
-        let _ = show_direct(
-            &cfg,
-            "ntfy-toast needs a topic",
-            &format!("Edit {} and restart ntfy-toast.", config_path.display()),
-            4,
-            "ntfy-toast",
-        );
-    }
-
-    register(&cfg.app_id, &cfg.app_display_name);
-    toast::prune_cache();
-
-    let cfg = Arc::new(cfg);
-    let state = Arc::new(subscriber::State::load(paths::state_file()));
-    let (tx, rx) = mpsc::channel();
-
-    for sub in cfg.subscriptions.clone() {
-        let (cfg, state, tx) = (cfg.clone(), state.clone(), tx.clone());
-        std::thread::Builder::new()
-            .name("subscriber".into())
-            .spawn(move || subscriber::run(sub, cfg, state, tx))?;
-    }
-    drop(tx);
-
-    // Subscribers never return, so this runs for the life of the process.
-    toast::run(rx, cfg);
-    Ok(())
-}
-
 fn main() {
     system::attach_console();
     let cli = Cli::parse();
@@ -252,7 +192,7 @@ fn main() {
     init_logging(cli.verbose, matches!(command, Command::Run));
 
     let result = match command {
-        Command::Run => run_daemon(config_path),
+        Command::Run => daemon::run(config_path),
         Command::Init { force } => write_sample_config(&config_path, force).map(|wrote| {
             if wrote {
                 println!("Wrote {}", config_path.display());

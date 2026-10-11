@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -71,8 +72,17 @@ fn stream_url(server: &str, topics: &[String], since: Option<&str>) -> String {
     url
 }
 
-/// Runs forever: keeps one streaming connection open for `sub`, reconnecting with backoff.
-pub fn run(sub: Subscription, cfg: Arc<Config>, state: Arc<State>, tx: Sender<Notice>) {
+/// Keeps one streaming connection open for `sub`, reconnecting with backoff, until `stop`
+/// is set. `resume` continues from the last persisted message id (used when a config
+/// reload replaces a running subscription, so nothing is missed during the swap).
+pub fn run(
+    sub: Subscription,
+    cfg: Arc<Config>,
+    state: Arc<State>,
+    tx: Sender<Notice>,
+    stop: Arc<AtomicBool>,
+    resume: bool,
+) {
     let server = sub.server(&cfg).to_string();
     let topics = sub.all_topics();
     let key = sub.state_key(&cfg);
@@ -81,7 +91,7 @@ pub fn run(sub: Subscription, cfg: Arc<Config>, state: Arc<State>, tx: Sender<No
     let label = format!("{server}/{}", topics.join(","));
 
     // `since` cursor: a message id, or a unix timestamp before the first message arrives.
-    let mut since: Option<String> = if cfg.catch_up_on_start {
+    let mut since: Option<String> = if cfg.catch_up_on_start || resume {
         state.get(&key)
     } else {
         None
@@ -89,7 +99,9 @@ pub fn run(sub: Subscription, cfg: Arc<Config>, state: Arc<State>, tx: Sender<No
     let mut recent: VecDeque<String> = VecDeque::new();
     let mut backoff = Duration::from_secs(1);
 
-    loop {
+    let stopped = || stop.load(Ordering::Relaxed);
+
+    while !stopped() {
         let url = stream_url(&server, &topics, since.as_deref());
         debug!("[{label}] connecting: {url}");
         let mut req = agent.get(&url);
@@ -100,6 +112,11 @@ pub fn run(sub: Subscription, cfg: Arc<Config>, state: Arc<State>, tx: Sender<No
         match req.call() {
             Ok(resp) => {
                 for line in BufReader::new(resp.into_reader()).lines() {
+                    // A stopped subscription may still be blocked in a read; once it wakes,
+                    // drop whatever arrived (its replacement resumes from the saved id).
+                    if stopped() {
+                        break;
+                    }
                     let line = match line {
                         Ok(l) => l,
                         Err(e) => {
@@ -172,10 +189,14 @@ pub fn run(sub: Subscription, cfg: Arc<Config>, state: Arc<State>, tx: Sender<No
             }
             Err(e) => warn!("[{label}] connect failed: {e}"),
         }
+        if stopped() {
+            break;
+        }
         debug!("[{label}] reconnecting in {backoff:?}");
         std::thread::sleep(backoff);
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
+    info!("[{label}] unsubscribed");
 }
 
 #[cfg(test)]
