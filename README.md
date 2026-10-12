@@ -13,6 +13,13 @@ and shows each message as a native Windows toast notification.
 
 [![Rust](https://github.com/daterrell/ntfy-toast/actions/workflows/rust.yml/badge.svg)](https://github.com/daterrell/ntfy-toast/actions/workflows/rust.yml)
 
+## Download
+
+Get `ntfy-toast.exe` from the [latest release](https://github.com/daterrell/ntfy-toast/releases/latest)
+([direct link](https://github.com/daterrell/ntfy-toast/releases/latest/download/ntfy-toast.exe)).
+It isn't code-signed, so SmartScreen may warn on first run: choose **More info → Run anyway**.
+Each release includes a `.sha256` file to check against `Get-FileHash ntfy-toast.exe`.
+
 ## Quick start
 
 ```powershell
@@ -116,3 +123,18 @@ cargo build --release --target x86_64-pc-windows-gnu
 ```
 
 `cargo test` runs on any platform. Off Windows, toasts are printed to stdout instead of shown.
+
+## Releasing
+
+Every push and pull request to `master` runs the tests and builds the exe; the build is
+attached to the workflow run as the `ntfy-toast-windows-x64` artifact.
+
+To publish a release, bump `version` in `Cargo.toml`, commit, and push a matching tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow checks that the tag matches `Cargo.toml`, then creates a GitHub Release with
+`ntfy-toast.exe` and its checksum.
