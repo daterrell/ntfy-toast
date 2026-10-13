@@ -1,8 +1,8 @@
-1 ICON "icon.ico"
+1 ICON "@ICON@"
 
 1 VERSIONINFO
-FILEVERSION 0,1,0,0
-PRODUCTVERSION 0,1,0,0
+FILEVERSION @VERSION_COMMAS@
+PRODUCTVERSION @VERSION_COMMAS@
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
@@ -10,8 +10,8 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "ntfy toast notification daemon"
       VALUE "ProductName", "ntfy-toast"
-      VALUE "FileVersion", "0.1.0"
-      VALUE "ProductVersion", "0.1.0"
+      VALUE "FileVersion", "@VERSION@"
+      VALUE "ProductVersion", "@VERSION@"
       VALUE "OriginalFilename", "ntfy-toast.exe"
     END
   END

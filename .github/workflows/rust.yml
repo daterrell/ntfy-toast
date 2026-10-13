@@ -6,7 +6,15 @@ on:
     tags: ["v*"]
   pull_request:
     branches: ["master"]
+  # Creating a release on GitHub's website builds the exe and attaches it to that release.
+  release:
+    types: [published]
   workflow_dispatch:
+
+# A release made on the website can also fire a tag push; run those one at a time.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -39,6 +47,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install mingw-w64
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Take version from tag
+        # The tag is the source of truth for releases: v1.2.3 builds version 1.2.3,
+        # whatever Cargo.toml says.
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' isn't a version number. Use a tag like v1.2.3."
+            exit 1
+          fi
+          sed -i "0,/^version = \".*\"/s//version = \"$version\"/" Cargo.toml
+          sed -i "/^name = \"ntfy-toast\"$/{n;s/^version = \".*\"/version = \"$version\"/}" Cargo.lock
+          echo "Building ntfy-toast $version"
       - run: cargo clippy --locked --release --target $TARGET -- -D warnings
       - run: cargo build --locked --release --target $TARGET
       - name: Collect binary
@@ -53,32 +74,30 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/')
     needs: [test, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Check tag matches Cargo.toml version
-        run: |
-          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
-            exit 1
-          fi
       - uses: actions/download-artifact@v4
         with:
           name: ntfy-toast-windows-x64
           path: dist
       - name: Publish release
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/ntfy-toast.exe dist/ntfy-toast.exe.sha256 \
-            --title "ntfy-toast $GITHUB_REF_NAME" \
-            --generate-notes \
-            --notes "$(cat <<'EOF'
+          files=(dist/ntfy-toast.exe dist/ntfy-toast.exe.sha256)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # Made on the website (or re-run): keep its title and notes, attach the exe.
+            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${files[@]}" \
+              --title "ntfy-toast $GITHUB_REF_NAME" \
+              --generate-notes \
+              --notes "$(cat <<'EOF'
           ## Install
 
           1. Download `ntfy-toast.exe` below and move it somewhere permanent, e.g. `%LOCALAPPDATA%\Programs\ntfy-toast\`.
@@ -89,3 +108,4 @@ jobs:
           Verify the download with `ntfy-toast.exe.sha256` (`Get-FileHash ntfy-toast.exe`).
           EOF
           )"
+          fi

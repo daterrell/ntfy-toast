@@ -129,12 +129,16 @@ cargo build --release --target x86_64-pc-windows-gnu
 Every push and pull request to `master` runs the tests and builds the exe; the build is
 attached to the workflow run as the `ntfy-toast-windows-x64` artifact.
 
-To publish a release, bump `version` in `Cargo.toml`, commit, and push a matching tag:
+To publish a release, do either of these. There's no version number to edit first: the
+tag (`v1.2.3`) sets the version the exe is built with.
 
-```sh
-git tag v0.1.0
-git push origin v0.1.0
-```
+- **On GitHub:** Releases → *Draft a new release* → choose a new tag like `v0.3.0` →
+  *Publish release*. The exe and its checksum are attached a couple of minutes later.
+- **From the command line:**
+  ```sh
+  git tag v0.3.0
+  git push origin v0.3.0
+  ```
+  This creates the release, with install notes and a changelog.
 
-The workflow checks that the tag matches `Cargo.toml`, then creates a GitHub Release with
-`ntfy-toast.exe` and its checksum.
+Tags that aren't version numbers (like `Release`) fail with an error instead of publishing.
