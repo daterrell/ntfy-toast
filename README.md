@@ -11,7 +11,7 @@ and shows each message as a native Windows toast notification.
 - Optionally catches up on messages published while it wasn't running
 - Picks up config edits live, with no restart needed
 
-[![Rust](https://github.com/daterrell/ntfy-toast/actions/workflows/rust.yml/badge.svg)](https://github.com/daterrell/ntfy-toast/actions/workflows/rust.yml)
+[![Rust](https://forgejo.terrell.ltd/dave/ntfy-toast/actions/workflows/rust.yml/badge.svg?branch=master)](https://forgejo.terrell.ltd/dave/ntfy-toast/actions?workflow=rust.yml)
 
 ## Download
 
