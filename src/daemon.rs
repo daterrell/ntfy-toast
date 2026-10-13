@@ -139,7 +139,7 @@ fn report_config_error(cfg: &Config, path: &Path, e: &anyhow::Error, keeping_old
 }
 
 pub fn run(config_path: PathBuf) -> Result<()> {
-    if !system::acquire_single_instance() {
+    if !system::acquire_single_instance(&paths::instance_name()) {
         info!("already running; exiting");
         return Ok(());
     }

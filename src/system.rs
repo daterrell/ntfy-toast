@@ -61,12 +61,12 @@ pub fn unregister_app_id(app_id: &str) -> Result<()> {
 
 /// Returns false if another daemon is already running for this user session.
 #[cfg(windows)]
-pub fn acquire_single_instance() -> bool {
-    use windows::core::w;
+pub fn acquire_single_instance(name: &str) -> bool {
+    use windows::core::HSTRING;
     use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
     unsafe {
-        match CreateMutexW(None, true, w!(r"Local\ntfy-toast-daemon")) {
+        match CreateMutexW(None, true, &HSTRING::from(name)) {
             // The handle is intentionally leaked: it must live as long as the process.
             Ok(_handle) => GetLastError() != ERROR_ALREADY_EXISTS,
             Err(_) => true,
@@ -90,6 +90,6 @@ pub fn unregister_app_id(_: &str) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-pub fn acquire_single_instance() -> bool {
+pub fn acquire_single_instance(_name: &str) -> bool {
     true
 }

@@ -177,6 +177,7 @@ fn show_direct(cfg: &Config, title: &str, message: &str, priority: u8, topic: &s
         server: cfg.default_server.clone(),
         auth: None,
         source_name: Some("ntfy-toast".into()),
+        topic_name: None,
     };
     let mut c = cfg.clone();
     c.click_opens_topic = false;

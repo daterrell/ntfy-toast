@@ -22,10 +22,15 @@ catch_up_on_start = false
 [[subscription]]
 topic = "change-me-to-your-topic"
 
-# Self-hosted server with access control, several topics, and a priority filter:
+# Self-hosted server with access control, several topics, and a priority filter.
+# A topic can be just its id, or `{ id = "...", name = "..." }` to show a friendlier
+# name on notifications (handy for random-looking topic ids):
 # [[subscription]]
 # server = "https://ntfy.example.com"
-# topics = ["alerts", "backups"]
+# topics = [
+#   "alerts",
+#   { id = "Xk29fQpL0aZr", name = "Backups" },
+# ]
 # token = "tk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxx"   # or: username = "..." + password = "..."
 # min_priority = 3                             # 1=min 2=low 3=default 4=high 5=urgent
 # name = "Home server"                         # shown as the attribution line
@@ -51,9 +56,9 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Subscription {
-    pub topic: Option<String>,
+    pub topic: Option<Topic>,
     #[serde(default)]
-    pub topics: Vec<String>,
+    pub topics: Vec<Topic>,
     pub server: Option<String>,
     pub token: Option<String>,
     pub username: Option<String>,
@@ -61,6 +66,40 @@ pub struct Subscription {
     #[serde(default = "one")]
     pub min_priority: u8,
     pub name: Option<String>,
+}
+
+/// A topic id, optionally with a display name: `"alerts"` or `{ id = "alerts", name = "Alerts" }`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[serde(
+    untagged,
+    expecting = "a topic id like \"alerts\", or a table like { id = \"alerts\", name = \"Alerts\" }"
+)]
+pub enum Topic {
+    Id(String),
+    Named(NamedTopic),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedTopic {
+    pub id: String,
+    pub name: String,
+}
+
+impl Topic {
+    pub fn id(&self) -> &str {
+        match self {
+            Topic::Id(id) => id,
+            Topic::Named(t) => &t.id,
+        }
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Topic::Id(_) => None,
+            Topic::Named(t) => Some(&t.name),
+        }
+    }
 }
 
 fn default_server() -> String {
@@ -105,7 +144,12 @@ impl Config {
                     || t.len() > 64
                     || !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
                 {
-                    bail!("invalid topic name {t:?} (allowed: A-Z a-z 0-9 _ -, max 64 chars)");
+                    bail!("invalid topic id {t:?} (allowed: A-Z a-z 0-9 _ -, max 64 chars)");
+                }
+            }
+            for t in sub.topic.iter().chain(&sub.topics) {
+                if t.name().is_some_and(|n| n.trim().is_empty()) {
+                    bail!("topic {:?} has an empty `name`", t.id());
                 }
             }
             if sub.token.is_some() && (sub.username.is_some() || sub.password.is_some()) {
@@ -123,14 +167,25 @@ impl Config {
 }
 
 impl Subscription {
+    /// Topic ids, in config order, without duplicates.
     pub fn all_topics(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.topic.iter().cloned().collect();
-        for t in &self.topics {
-            if !v.contains(t) {
-                v.push(t.clone());
+        let mut v: Vec<String> = Vec::new();
+        for t in self.topic.iter().chain(&self.topics) {
+            if !v.iter().any(|x| x == t.id()) {
+                v.push(t.id().to_string());
             }
         }
         v
+    }
+
+    /// The configured display name for a topic id, if any.
+    pub fn topic_name(&self, id: &str) -> Option<&str> {
+        self.topic
+            .iter()
+            .chain(&self.topics)
+            .find(|t| t.id() == id && t.name().is_some())
+            .and_then(Topic::name)
+            .map(str::trim)
     }
 
     pub fn server<'a>(&'a self, cfg: &'a Config) -> &'a str {
@@ -202,5 +257,47 @@ mod tests {
         assert!(Config::parse("[[subscription]]\ntopic = \"bad topic\"").is_err());
         assert!(Config::parse("[[subscription]]\ntopic = \"a\"\nusername = \"u\"").is_err());
         assert!(Config::parse("").is_err());
+    }
+
+    #[test]
+    fn topics_can_have_names() {
+        // Mixed plain ids and named tables, spread over lines with comments.
+        let cfg = Config::parse(
+            r#"
+            [[subscription]]
+            topic = { id = "solo", name = "Solo" }
+            topics = [
+              { id = "CgbRePrzudWiLmVl", name = "Frigate" }, # cameras
+              "HomeAssistant",
+              { id = "dAr9b0rpwA9kOS40", name = "VORON" },
+              ]
+            "#,
+        )
+        .unwrap();
+        let s = &cfg.subscriptions[0];
+        assert_eq!(
+            s.all_topics(),
+            ["solo", "CgbRePrzudWiLmVl", "HomeAssistant", "dAr9b0rpwA9kOS40"]
+        );
+        assert_eq!(s.topic_name("CgbRePrzudWiLmVl"), Some("Frigate"));
+        assert_eq!(s.topic_name("solo"), Some("Solo"));
+        assert_eq!(s.topic_name("HomeAssistant"), None);
+        // Names don't change which messages a saved position belongs to.
+        assert_eq!(
+            s.state_key(&cfg),
+            "https://ntfy.sh/solo,CgbRePrzudWiLmVl,HomeAssistant,dAr9b0rpwA9kOS40"
+        );
+    }
+
+    #[test]
+    fn bad_topic_entries_are_explained() {
+        let err = Config::parse("[[subscription]]\ntopics = [{ id = \"a\", nmae = \"A\" }]")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("a topic id like"), "{err}");
+        assert!(Config::parse("[[subscription]]\ntopics = [{ id = \"a\", name = \" \" }]").is_err());
+        assert!(
+            Config::parse("[[subscription]]\ntopics = [{ id = \"bad id\", name = \"x\" }]").is_err()
+        );
     }
 }

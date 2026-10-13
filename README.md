@@ -66,11 +66,19 @@ topic = "my-alerts"
 
 [[subscription]]
 server = "https://ntfy.example.com"
-topics = ["backups", "cameras"]
+topics = [
+  "backups",
+  { id = "CgbRePrzudWiLmVl", name = "Cameras" },   # shown as "Cameras" on toasts
+]
 token = "tk_..."               # or username = "..." + password = "..."
 min_priority = 3
 name = "Home server"           # attribution line on the toast
 ```
+
+Each topic is either its id (`"backups"`) or a table with a display `name`. The name
+replaces the topic id in the toast's title (when the message has no title of its own)
+and in the attribution line, which helps when topic ids are random strings. The id is
+still what's subscribed to and what clicking a toast opens.
 
 Changes to the config are applied automatically while the daemon runs (it checks every
 2 seconds). Only subscriptions whose settings changed are reconnected; ones that were
@@ -82,7 +90,7 @@ stay in effect until the file is fixed.
 
 | ntfy | Toast |
 |------|-------|
-| Title / message | Title / body (title defaults to the topic name) |
+| Title / message | Title / body (title defaults to the topic's configured name, or its id) |
 | Tags | Emoji shortcodes become an emoji prefix on the title; other tags are listed as `Tags: …` |
 | Priority 1 (min) | Silent, goes straight to the notification center with no popup |
 | Priority 2 (low) | Silent popup |
@@ -104,6 +112,18 @@ stay in effect until the file is fixed.
 - Image cache: `%LOCALAPPDATA%\ntfy-toast\cache\` (files older than a day are pruned at startup)
 - Registry: `HKCU\Software\Classes\AppUserModelId\ntfy-toast` (toast name and icon) and
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\ntfy-toast` (autostart)
+
+Set `NTFY_TOAST_DATA_DIR` to use a different data directory, for example to run a second,
+separate copy for testing (each data directory gets its own single-instance lock).
+
+## Troubleshooting
+
+**The log shows `connect failed` timeouts and nothing arrives.** ntfy-toast uses HTTP/2
+when the server offers it, which streams fine through most reverse proxies. If your
+server is behind nginx (including Nginx Proxy Manager) and only offers HTTP/1.1, nginx
+holds back the stream until `proxy_buffering off` is set for ntfy; see
+[ntfy's proxy docs](https://docs.ntfy.sh/config/#nginxapache2caddy). The log points this
+out when it happens.
 
 ## Building
 
