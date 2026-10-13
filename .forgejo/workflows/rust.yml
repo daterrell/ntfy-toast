@@ -6,7 +6,7 @@ on:
     tags: ["v*"]
   pull_request:
     branches: ["master"]
-  # Creating a release on GitHub's website builds the exe and attaches it to that release.
+  # Creating a release on Forgejo's website also builds the exe and publishes it to GitHub.
   release:
     types: [published]
   workflow_dispatch:
@@ -67,7 +67,8 @@ jobs:
           mkdir dist
           cp target/$TARGET/release/ntfy-toast.exe dist/
           cd dist && sha256sum ntfy-toast.exe > ntfy-toast.exe.sha256
-      - uses: actions/upload-artifact@v4
+      # Forgejo's fork: GitHub's upload/download-artifact v4+ don't work against Forgejo.
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         with:
           name: ntfy-toast-windows-x64
           path: dist/
@@ -80,13 +81,26 @@ jobs:
     permissions:
       contents: write
     env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
+      # Releases are published on GitHub. Forgejo push-mirrors the repo there, tags included.
+      GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+      GH_REPO: daterrell/ntfy-toast
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
           name: ntfy-toast-windows-x64
           path: dist
+      - name: Install gh
+        run: |
+          curl -fsSL https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_amd64.tar.gz | tar xz -C /tmp
+          sudo install /tmp/gh_2.102.0_linux_amd64/bin/gh /usr/local/bin/gh
+      - name: Wait for the push mirror to bring the tag to GitHub
+        run: |
+          for _ in $(seq 60); do
+            gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" --silent 2>/dev/null && exit 0
+            sleep 5
+          done
+          echo "::error::$GITHUB_REF_NAME didn't reach github.com/$GH_REPO; check the repo's push mirror."
+          exit 1
       - name: Publish release
         run: |
           files=(dist/ntfy-toast.exe dist/ntfy-toast.exe.sha256)
@@ -94,7 +108,7 @@ jobs:
             # Made on the website (or re-run): keep its title and notes, attach the exe.
             gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" "${files[@]}" \
+            gh release create "$GITHUB_REF_NAME" "${files[@]}" --verify-tag \
               --title "ntfy-toast $GITHUB_REF_NAME" \
               --generate-notes \
               --notes "$(cat <<'EOF'
