@@ -19,6 +19,8 @@ pub struct Notice {
     pub server: String,
     pub auth: Option<String>,
     pub source_name: Option<String>,
+    /// Display name for the topic, if the config gives one.
+    pub topic_name: Option<String>,
 }
 
 /// Last-seen message id per subscription, persisted so `catch_up_on_start` can resume.
@@ -55,12 +57,35 @@ impl State {
     }
 }
 
-pub fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(15))
-        .timeout_read(READ_TIMEOUT)
+pub type Http = reqwest::blocking::Client;
+
+/// HTTP client shared by subscriptions and image downloads. It speaks HTTP/2 when the
+/// server offers it: some reverse proxies (nginx with `proxy_buffering on`) hold back
+/// streamed HTTP/1.1 responses entirely but pass HTTP/2 streams through.
+pub fn http() -> Http {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        // Applies to waiting for the response headers and to each read of the stream,
+        // not to the whole (endless) response.
+        .timeout(READ_TIMEOUT)
         .user_agent(concat!("ntfy-toast/", env!("CARGO_PKG_VERSION")))
         .build()
+        .expect("HTTP client")
+}
+
+/// `error sending request: ... : connection refused`, rather than just the outermost error.
+pub fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(s) = source {
+        let text = s.to_string();
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = s.source();
+    }
+    out
 }
 
 fn stream_url(server: &str, topics: &[String], since: Option<&str>) -> String {
@@ -87,7 +112,8 @@ pub fn run(
     let topics = sub.all_topics();
     let key = sub.state_key(&cfg);
     let auth = sub.auth_header();
-    let agent = agent();
+    let http = http();
+    let mut hinted = false;
     let label = format!("{server}/{}", topics.join(","));
 
     // `since` cursor: a message id, or a unix timestamp before the first message arrives.
@@ -104,14 +130,22 @@ pub fn run(
     while !stopped() {
         let url = stream_url(&server, &topics, since.as_deref());
         debug!("[{label}] connecting: {url}");
-        let mut req = agent.get(&url);
+        let mut req = http.get(&url);
         if let Some(a) = &auth {
-            req = req.set("Authorization", a);
+            req = req.header("Authorization", a);
         }
         let started = Instant::now();
-        match req.call() {
+        match req.send() {
+            Ok(resp) if !resp.status().is_success() => {
+                let code = resp.status().as_u16();
+                let body = resp.text().unwrap_or_default();
+                error!("[{label}] server returned HTTP {code}: {}", body.trim());
+                if code == 401 || code == 403 {
+                    backoff = MAX_BACKOFF;
+                }
+            }
             Ok(resp) => {
-                for line in BufReader::new(resp.into_reader()).lines() {
+                for line in BufReader::new(resp).lines() {
                     // A stopped subscription may still be blocked in a read; once it wakes,
                     // drop whatever arrived (its replacement resumes from the saved id).
                     if stopped() {
@@ -120,7 +154,7 @@ pub fn run(
                     let line = match line {
                         Ok(l) => l,
                         Err(e) => {
-                            warn!("[{label}] connection lost: {e}");
+                            warn!("[{label}] connection lost: {}", error_chain(&e));
                             break;
                         }
                     };
@@ -162,12 +196,19 @@ pub fn run(
                                 debug!("[{label}] skipped low-priority message {}", msg.id);
                                 continue;
                             }
-                            info!("[{label}] message {} on {}", msg.id, msg.topic);
+                            let topic_name = sub.topic_name(&msg.topic).map(str::to_string);
+                            match &topic_name {
+                                Some(name) => {
+                                    info!("[{label}] message {} on {name} ({})", msg.id, msg.topic)
+                                }
+                                None => info!("[{label}] message {} on {}", msg.id, msg.topic),
+                            }
                             let notice = Notice {
                                 msg,
                                 server: server.clone(),
                                 auth: auth.clone(),
                                 source_name: sub.name.clone(),
+                                topic_name,
                             };
                             if tx.send(notice).is_err() {
                                 return;
@@ -180,14 +221,17 @@ pub fn run(
                     backoff = Duration::from_secs(1);
                 }
             }
-            Err(ureq::Error::Status(code, resp)) => {
-                let body = resp.into_string().unwrap_or_default();
-                error!("[{label}] server returned HTTP {code}: {}", body.trim());
-                if code == 401 || code == 403 {
-                    backoff = MAX_BACKOFF;
+            Err(e) => {
+                warn!("[{label}] connect failed: {}", error_chain(&e));
+                if e.is_timeout() && !hinted {
+                    hinted = true;
+                    warn!(
+                        "[{label}] the server accepted the connection but sent no response. \
+                         If it's behind nginx or Nginx Proxy Manager, set `proxy_buffering off` \
+                         for ntfy (see https://docs.ntfy.sh/config/#nginxapache2caddy)."
+                    );
                 }
             }
-            Err(e) => warn!("[{label}] connect failed: {e}"),
         }
         if stopped() {
             break;

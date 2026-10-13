@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::message::{tag_emoji, Message};
 use crate::paths;
-use crate::subscriber::Notice;
+use crate::subscriber::{error_chain, Http, Notice};
 use log::{debug, info, warn};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
@@ -62,7 +62,9 @@ pub fn build(n: &Notice, cfg: &Config, icon: Option<&Path>, image: Option<&Path>
         .map(String::as_str)
         .collect();
 
-    let title_text = m.title.clone().unwrap_or_else(|| m.topic.clone());
+    // A configured topic name stands in for random-looking topic ids.
+    let topic = n.topic_name.as_deref().unwrap_or(&m.topic);
+    let title_text = m.title.clone().unwrap_or_else(|| topic.to_string());
     let title = if emoji.is_empty() {
         title_text
     } else {
@@ -88,8 +90,8 @@ pub fn build(n: &Notice, cfg: &Config, icon: Option<&Path>, image: Option<&Path>
         .unwrap_or(&n.server)
         .to_string();
     let attribution = match &n.source_name {
-        Some(name) => format!("{name} · {}", m.topic),
-        None => format!("{} · {host}", m.topic),
+        Some(name) => format!("{name} · {topic}"),
+        None => format!("{topic} · {host}"),
     };
 
     let click = m.click.clone().or_else(|| {
@@ -188,7 +190,7 @@ pub fn build(n: &Notice, cfg: &Config, icon: Option<&Path>, image: Option<&Path>
 }
 
 /// Download an image to the local cache (toasts from unpackaged apps can't use http images).
-fn fetch_image(agent: &ureq::Agent, url: &str, n: &Notice) -> Option<PathBuf> {
+fn fetch_image(http: &Http, url: &str, n: &Notice) -> Option<PathBuf> {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     url.hash(&mut h);
     let lower = url.to_ascii_lowercase();
@@ -201,29 +203,31 @@ fn fetch_image(agent: &ureq::Agent, url: &str, n: &Notice) -> Option<PathBuf> {
         return Some(path);
     }
 
-    let mut req = agent.get(url);
+    let mut req = http.get(url);
     if let Some(a) = &n.auth {
         if url.starts_with(&n.server) {
-            req = req.set("Authorization", a);
+            req = req.header("Authorization", a);
         }
     }
-    let resp = match req.call() {
+    let resp = match req.send().and_then(|r| r.error_for_status()) {
         Ok(r) => r,
         Err(e) => {
-            warn!("could not fetch image {url}: {e}");
+            warn!("could not fetch image {url}: {}", error_chain(&e));
             return None;
         }
     };
-    if !resp.content_type().starts_with("image/") {
-        warn!("not an image ({}): {url}", resp.content_type());
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !content_type.starts_with("image/") {
+        warn!("not an image ({content_type}): {url}");
         return None;
     }
     let mut buf = Vec::new();
-    if let Err(e) = resp
-        .into_reader()
-        .take(MAX_IMAGE_BYTES + 1)
-        .read_to_end(&mut buf)
-    {
+    if let Err(e) = resp.take(MAX_IMAGE_BYTES + 1).read_to_end(&mut buf) {
         warn!("could not fetch image {url}: {e}");
         return None;
     }
@@ -236,9 +240,9 @@ fn fetch_image(agent: &ureq::Agent, url: &str, n: &Notice) -> Option<PathBuf> {
     Some(path)
 }
 
-fn prepare(agent: &ureq::Agent, n: &Notice, cfg: &Config) -> Toast {
+fn prepare(http: &Http, n: &Notice, cfg: &Config) -> Toast {
     let m: &Message = &n.msg;
-    let icon = m.icon.as_deref().and_then(|u| fetch_image(agent, u, n));
+    let icon = m.icon.as_deref().and_then(|u| fetch_image(http, u, n));
     let image = m.attachment.as_ref().and_then(|a| {
         let is_image = a
             .mime
@@ -246,7 +250,7 @@ fn prepare(agent: &ureq::Agent, n: &Notice, cfg: &Config) -> Toast {
             .is_some_and(|t| t.starts_with("image/") && t != "image/svg+xml");
         let small = a.size.is_none_or(|s| s <= MAX_IMAGE_BYTES);
         (is_image && small)
-            .then(|| fetch_image(agent, &a.url, n))
+            .then(|| fetch_image(http, &a.url, n))
             .flatten()
     });
     build(n, cfg, icon.as_deref(), image.as_deref())
@@ -276,7 +280,7 @@ pub type SharedConfig = Arc<RwLock<Arc<Config>>>;
 
 /// Toast thread: owns the WinRT notifier and displays notices as they arrive.
 pub fn run(rx: Receiver<Notice>, shared: SharedConfig) {
-    let agent = crate::subscriber::agent();
+    let http = crate::subscriber::http();
     let mut notifier: Option<(String, platform::Notifier)> = None;
     for n in rx {
         let cfg = shared.read().unwrap().clone();
@@ -292,7 +296,7 @@ pub fn run(rx: Receiver<Notice>, shared: SharedConfig) {
         let Some((_, notifier)) = &notifier else {
             continue;
         };
-        let toast = prepare(&agent, &n, &cfg);
+        let toast = prepare(&http, &n, &cfg);
         if let Err(e) = notifier.show(&toast, &toast.xml) {
             warn!("toast rejected ({e:#}); retrying without extras");
             if let Err(e) = notifier.show(&toast, &toast.fallback_xml) {
@@ -373,6 +377,7 @@ mod tests {
             server: "https://ntfy.sh".into(),
             auth: None,
             source_name: None,
+            topic_name: None,
         }
     }
 
@@ -439,6 +444,24 @@ mod tests {
         assert!(t.xml.contains(r#"content="Open""#));
         assert!(!t.xml.contains("Disarm"));
         assert!(t.xml.contains(r#"content="Open log.txt""#));
+    }
+
+    #[test]
+    fn topic_name_replaces_id_in_display() {
+        let mut n = notice(Message {
+            id: "abc".into(),
+            event: "message".into(),
+            topic: "CgbRePrzudWiLmVl".into(),
+            message: Some("person detected".into()),
+            ..Default::default()
+        });
+        n.topic_name = Some("Frigate".into());
+        let t = build(&n, &cfg(), None, None);
+        assert!(t.xml.contains("<text>Frigate</text>"), "{}", t.xml);
+        assert!(t.xml.contains("Frigate · ntfy.sh"));
+        // The click URL and grouping still use the real topic id.
+        assert!(t.xml.contains(r#"launch="https://ntfy.sh/CgbRePrzudWiLmVl""#));
+        assert_eq!(t.group, "CgbRePrzudWiLmVl");
     }
 
     #[test]
