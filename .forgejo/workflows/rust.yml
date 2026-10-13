@@ -2,10 +2,10 @@ name: Rust
 
 on:
   push:
-    branches: ["master"]
+    branches: ["main"]
     tags: ["v*"]
   pull_request:
-    branches: ["master"]
+    branches: ["main"]
   # Creating a release on Forgejo's website also builds the exe and publishes it to GitHub.
   release:
     types: [published]

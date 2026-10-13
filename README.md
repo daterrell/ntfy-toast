@@ -11,7 +11,7 @@ and shows each message as a native Windows toast notification.
 - Optionally catches up on messages published while it wasn't running
 - Picks up config edits live, with no restart needed
 
-[![Rust](https://forgejo.terrell.ltd/dave/ntfy-toast/actions/workflows/rust.yml/badge.svg?branch=master)](https://forgejo.terrell.ltd/dave/ntfy-toast/actions?workflow=rust.yml)
+[![Rust](https://forgejo.terrell.ltd/dave/ntfy-toast/actions/workflows/rust.yml/badge.svg?branch=main)](https://forgejo.terrell.ltd/dave/ntfy-toast/actions?workflow=rust.yml)
 
 ## Download
 
@@ -146,7 +146,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 ## Releasing
 
-Every push and pull request to `master` runs the tests and builds the exe; the build is
+Every push and pull request to `main` runs the tests and builds the exe; the build is
 attached to the workflow run as the `ntfy-toast-windows-x64` artifact.
 
 To publish a release, do either of these. There's no version number to edit first: the
