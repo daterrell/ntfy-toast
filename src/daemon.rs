@@ -1,8 +1,8 @@
 //! The long-running daemon: starts subscriptions, and applies config file changes live.
 
-use crate::config::{self, Config, Subscription};
+use crate::config::{self, Config, Subscription, Topic};
 use crate::toast::SharedConfig;
-use crate::{paths, register, show_direct, subscriber, system, toast, write_sample_config};
+use crate::{paths, register, show_direct, subscriber, system, toast, updater, write_sample_config};
 use anyhow::Result;
 use log::{error, info, warn};
 use std::collections::{HashMap, HashSet};
@@ -15,6 +15,8 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Editors often write a file in several steps; wait for it to stop changing.
 const SETTLE_TIME: Duration = Duration::from_millis(500);
 const PLACEHOLDER_TOPIC: &str = "change-me-to-your-topic";
+/// Give the network a moment after login before the first update check.
+const FIRST_UPDATE_CHECK: Duration = Duration::from_secs(30);
 
 /// A running subscription is identified by its full settings plus its resolved server,
 /// so changing anything about it (or `default_server`) restarts it.
@@ -74,6 +76,9 @@ struct Supervisor {
     state: Arc<subscriber::State>,
     tx: mpsc::Sender<subscriber::Notice>,
     running: HashMap<SubKey, Arc<AtomicBool>>,
+    /// Messages on the release topic go here (they trigger an update check, not a toast).
+    update_tx: mpsc::Sender<subscriber::Notice>,
+    update_sub: Option<((String, String), Arc<AtomicBool>)>,
 }
 
 impl Supervisor {
@@ -101,6 +106,41 @@ impl Supervisor {
                 .name("subscriber".into())
                 .spawn(move || subscriber::run(sub, cfg, state, tx, stop, resume))?;
         }
+        self.apply_update_topic(&cfg)
+    }
+
+    /// Follow the release topic from `[update]`, restarting the subscription if it changed.
+    fn apply_update_topic(&mut self, cfg: &Arc<Config>) -> Result<()> {
+        let wanted = cfg.update.topic_parts();
+        if self.update_sub.as_ref().map(|(k, _)| k) == wanted.as_ref() {
+            return Ok(());
+        }
+        if let Some((_, stop)) = self.update_sub.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        let Some((server, topic)) = wanted else {
+            return Ok(());
+        };
+        let sub = Subscription {
+            topic: Some(Topic::Id(topic.clone())),
+            topics: Vec::new(),
+            server: Some(server.clone()),
+            token: None,
+            username: None,
+            password: None,
+            min_priority: 1,
+            name: None,
+        };
+        // Releases missed while offline are found by the startup check instead.
+        let mut sub_cfg = (**cfg).clone();
+        sub_cfg.catch_up_on_start = false;
+        let sub_cfg = Arc::new(sub_cfg);
+        let stop = Arc::new(AtomicBool::new(false));
+        self.update_sub = Some(((server, topic), stop.clone()));
+        let (state, tx) = (self.state.clone(), self.update_tx.clone());
+        std::thread::Builder::new()
+            .name("release-topic".into())
+            .spawn(move || subscriber::run(sub, sub_cfg, state, tx, stop, false))?;
         Ok(())
     }
 }
@@ -139,11 +179,20 @@ fn report_config_error(cfg: &Config, path: &Path, e: &anyhow::Error, keeping_old
 }
 
 pub fn run(config_path: PathBuf) -> Result<()> {
-    if !system::acquire_single_instance(&paths::instance_name()) {
+    // Set when the previous version restarted us after installing this one.
+    let updated_from = std::env::var(updater::UPDATED_FROM_ENV).ok();
+    std::env::remove_var(updater::UPDATED_FROM_ENV);
+    let wait = if updated_from.is_some() {
+        Duration::from_secs(30)
+    } else {
+        Duration::ZERO
+    };
+    if !system::acquire_single_instance(&paths::instance_name(), wait) {
         info!("already running; exiting");
         return Ok(());
     }
     info!("ntfy-toast {} starting", env!("CARGO_PKG_VERSION"));
+    updater::cleanup_old();
 
     if write_sample_config(&config_path, false)? {
         info!("created sample config at {}", config_path.display());
@@ -156,11 +205,50 @@ pub fn run(config_path: PathBuf) -> Result<()> {
 
     let (tx, rx) = mpsc::channel();
     let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(idle.clone())));
+    let (update_tx, update_rx) = mpsc::channel::<subscriber::Notice>();
+    let (event_tx, event_rx) = mpsc::channel();
+    {
+        let (shared, toasts) = (shared.clone(), tx.clone());
+        std::thread::Builder::new()
+            .name("updater".into())
+            .spawn(move || updater::run(event_rx, shared, toasts))?;
+    }
+    {
+        let events = event_tx.clone();
+        std::thread::Builder::new()
+            .name("release-announcements".into())
+            .spawn(move || {
+                for n in update_rx {
+                    info!("release topic posted ({}); checking for updates", n.msg.id);
+                    let _ = events.send(updater::Event::Check);
+                }
+            })?;
+    }
+    {
+        let events = event_tx.clone();
+        std::thread::Builder::new()
+            .name("install-requests".into())
+            .spawn(move || {
+                system::wait_for_signals(&paths::update_event_name(), || {
+                    info!("install requested");
+                    let _ = events.send(updater::Event::Install);
+                })
+            })?;
+    }
+    std::thread::Builder::new()
+        .name("first-update-check".into())
+        .spawn(move || {
+            std::thread::sleep(FIRST_UPDATE_CHECK);
+            let _ = event_tx.send(updater::Event::Check);
+        })?;
+
     let mut sup = Supervisor {
         shared: shared.clone(),
         state: Arc::new(subscriber::State::load(paths::state_file())),
         tx,
         running: HashMap::new(),
+        update_tx,
+        update_sub: None,
     };
     std::thread::Builder::new()
         .name("toast".into())
@@ -171,6 +259,16 @@ pub fn run(config_path: PathBuf) -> Result<()> {
         Ok(cfg) => {
             warn_placeholder(&cfg, &config_path);
             sup.apply(cfg.clone())?;
+            if let Some(from) = &updated_from {
+                info!("updated from {from}");
+                let _ = show_direct(
+                    &cfg,
+                    &format!("ntfy-toast updated to {}", env!("CARGO_PKG_VERSION")),
+                    &format!("Previously {from}."),
+                    2,
+                    "ntfy-toast",
+                );
+            }
             Some(cfg)
         }
         Err(e) => {

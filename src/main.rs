@@ -9,6 +9,7 @@ mod paths;
 mod subscriber;
 mod system;
 mod toast;
+mod updater;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -61,6 +62,12 @@ enum Command {
     },
     /// Print config, log and data locations
     Paths,
+    /// Install the latest release (hands off to the running daemon if there is one)
+    Update {
+        /// Only report whether an update is available
+        #[arg(long)]
+        check: bool,
+    },
     /// Run an http action button (launched by Windows for ntfy-toast-action: URIs)
     #[command(hide = true)]
     Action { uri: String },
@@ -164,6 +171,11 @@ fn register(app_id: &str, display_name: &str) {
     if let Err(e) = system::register_app_id(app_id, display_name, &icon) {
         error!("could not register notification identity: {e:#}");
     }
+    // The button handler is per Windows user, not per copy: a test or portable copy
+    // (NTFY_TOAST_DATA_DIR) must not point the main install's buttons at itself.
+    if paths::data_dir_overridden() {
+        return;
+    }
     if let Err(e) = system::register_action_protocol() {
         error!("could not register action buttons: {e:#}");
     }
@@ -179,6 +191,39 @@ fn run_action(cfg: &Config, uri: &str) -> Result<()> {
     }
     if a.clear {
         toast::platform::remove(&cfg.app_id, &a.tag, &a.group)?;
+    }
+    Ok(())
+}
+
+/// The Install button and `ntfy-toast update`: ask the running daemon to update (it
+/// restarts itself), or update this exe directly if no daemon is running.
+fn update_now(cfg: &Config) -> Result<()> {
+    if system::signal(&paths::update_event_name()) {
+        info!("asked the running daemon to install the update");
+        println!("Asked the running ntfy-toast to update; it restarts when done.");
+        return Ok(());
+    }
+    let http = subscriber::http();
+    match updater::check(&http, &cfg.update)? {
+        None => println!("ntfy-toast {} is up to date.", updater::Version::current()),
+        Some(rel) => {
+            updater::install(&http, &rel)?;
+            println!("Installed ntfy-toast {}.", rel.version);
+        }
+    }
+    Ok(())
+}
+
+fn check_update(cfg: &Config) -> Result<()> {
+    let src = updater::Source::from_config(&cfg.update);
+    let rel = updater::latest(&subscriber::http(), &cfg.update)?;
+    let current = updater::Version::current();
+    println!("installed: {current}");
+    println!("latest:    {} ({})", rel.version, src.label);
+    if rel.version > current {
+        println!("Update available: run `ntfy-toast update` or use the notification's Install button.");
+    } else {
+        println!("Up to date.");
     }
     Ok(())
 }
@@ -211,7 +256,10 @@ fn main() {
     let cli = Cli::parse();
     let config_path = cli.config.clone().unwrap_or_else(paths::default_config_file);
     let command = cli.command.unwrap_or(Command::Run);
-    init_logging(cli.verbose, matches!(command, Command::Run | Command::Action { .. }));
+    init_logging(
+        cli.verbose,
+        matches!(command, Command::Run | Command::Action { .. } | Command::Update { .. }),
+    );
 
     let result = match command {
         Command::Run => daemon::run(config_path),
@@ -261,7 +309,19 @@ fn main() {
         })(),
         Command::Action { uri } => (|| {
             let cfg = Config::load(&config_path).or_else(|_| Config::parse(config::SAMPLE))?;
-            run_action(&cfg, &uri)
+            if uri.trim_end_matches('/') == updater::INSTALL_URI {
+                update_now(&cfg)
+            } else {
+                run_action(&cfg, &uri)
+            }
+        })(),
+        Command::Update { check } => (|| {
+            let cfg = Config::load(&config_path)?;
+            if check {
+                check_update(&cfg)
+            } else {
+                update_now(&cfg)
+            }
         })(),
         Command::Paths => {
             println!("config: {}", config_path.display());
