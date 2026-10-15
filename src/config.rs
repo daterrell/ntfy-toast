@@ -27,6 +27,9 @@ topic = "change-me-to-your-topic"
 [update]
 # "notify" (ask first), "auto" (install right away), or "off".
 mode = "notify"
+# "stable" for formal releases only, or "dev" to also get the build CI publishes for every
+# change merged to main (needs the Forgejo token below).
+channel = "stable"
 # Where releases are published: a Forgejo/Gitea server, or https://github.com.
 server = "https://forgejo.terrell.ltd"
 repo = "dave/ntfy-toast"
@@ -75,6 +78,7 @@ pub struct Config {
 #[serde(deny_unknown_fields, default)]
 pub struct UpdateConfig {
     pub mode: UpdateMode,
+    pub channel: Channel,
     /// Forgejo/Gitea base URL, or `https://github.com`.
     pub server: String,
     /// `owner/name` on `server`.
@@ -98,10 +102,21 @@ pub enum UpdateMode {
     Off,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Channel {
+    /// Formal (tagged) releases only.
+    #[default]
+    Stable,
+    /// Also the development builds published for every merge to main.
+    Dev,
+}
+
 impl Default for UpdateConfig {
     fn default() -> Self {
         UpdateConfig {
             mode: UpdateMode::Notify,
+            channel: Channel::Stable,
             server: "https://forgejo.terrell.ltd".into(),
             repo: "dave/ntfy-toast".into(),
             token: None,
@@ -371,6 +386,7 @@ mod tests {
             topic = "a"
             [update]
             mode = "auto"
+            channel = "dev"
             server = "github.com/"
             repo = "someone/ntfy-toast"
             token = " "
@@ -379,6 +395,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.update.mode, UpdateMode::Auto);
+        assert_eq!(cfg.update.channel, Channel::Dev);
         assert_eq!(cfg.update.server, "https://github.com");
         assert_eq!(cfg.update.token, None);
         assert_eq!(cfg.update.topic_parts(), None);
@@ -388,6 +405,7 @@ mod tests {
 
         for bad in [
             "mode = \"sometimes\"",
+            "channel = \"nightly\"",
             "repo = \"just-a-name\"",
             "topic = \"ntfy.sh/x\"",
             "topic = \"https://ntfy.sh/bad topic\"",

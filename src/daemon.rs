@@ -4,7 +4,7 @@ use crate::config::{self, Config, Subscription, Topic};
 use crate::toast::SharedConfig;
 use crate::{paths, register, show_direct, subscriber, system, toast, updater, write_sample_config};
 use anyhow::Result;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -191,7 +191,7 @@ pub fn run(config_path: PathBuf) -> Result<()> {
         info!("already running; exiting");
         return Ok(());
     }
-    info!("ntfy-toast {} starting", env!("CARGO_PKG_VERSION"));
+    info!("ntfy-toast {} starting", crate::VERSION);
     updater::cleanup_old();
 
     if write_sample_config(&config_path, false)? {
@@ -214,11 +214,17 @@ pub fn run(config_path: PathBuf) -> Result<()> {
             .spawn(move || updater::run(event_rx, shared, toasts))?;
     }
     {
-        let events = event_tx.clone();
+        let (events, shared) = (event_tx.clone(), shared.clone());
         std::thread::Builder::new()
             .name("release-announcements".into())
             .spawn(move || {
                 for n in update_rx {
+                    // CI tags development-build announcements "dev"; only that channel wants them.
+                    let channel = shared.read().unwrap().update.channel;
+                    if channel == crate::config::Channel::Stable && n.msg.tags.iter().any(|t| t == "dev") {
+                        debug!("release topic posted a dev build ({}); ignored on the stable channel", n.msg.id);
+                        continue;
+                    }
                     info!("release topic posted ({}); checking for updates", n.msg.id);
                     let _ = events.send(updater::Event::Check);
                 }
@@ -263,7 +269,7 @@ pub fn run(config_path: PathBuf) -> Result<()> {
                 info!("updated from {from}");
                 let _ = show_direct(
                     &cfg,
-                    &format!("ntfy-toast updated to {}", env!("CARGO_PKG_VERSION")),
+                    &format!("ntfy-toast updated to {}", crate::VERSION),
                     &format!("Previously {from}."),
                     2,
                     "ntfy-toast",
