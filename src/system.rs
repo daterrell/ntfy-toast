@@ -1,4 +1,4 @@
-//! Windows integration: toast identity, autostart, single instance, console.
+//! Windows integration: toast identity, action URI scheme, autostart, single instance, console.
 //! Every function is a no-op (or a plain error) on other platforms.
 
 use anyhow::Result;
@@ -7,6 +7,11 @@ use anyhow::Result;
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg_attr(not(windows), allow(dead_code))]
 const RUN_VALUE: &str = "ntfy-toast";
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn protocol_key() -> String {
+    format!(r"Software\Classes\{}", crate::action::SCHEME)
+}
 
 #[cfg_attr(not(windows), allow(dead_code))]
 fn aumid_key(app_id: &str) -> String {
@@ -32,6 +37,28 @@ pub fn register_app_id(app_id: &str, display_name: &str, icon: &std::path::Path)
     key.set_value("IconUri", &icon.display().to_string())?;
     key.set_value("IconBackgroundColor", &"FF338574")?;
     Ok(())
+}
+
+/// Route `ntfy-toast-action:` URIs (http action buttons) to `<this exe> action <uri>`.
+#[cfg(windows)]
+pub fn register_action_protocol() -> Result<()> {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    let exe = std::env::current_exe()?;
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(protocol_key())?;
+    key.set_value("", &"URL:ntfy-toast action")?;
+    key.set_value("URL Protocol", &"")?;
+    let (cmd, _) = key.create_subkey(r"shell\open\command")?;
+    cmd.set_value("", &format!("\"{}\" action \"%1\"", exe.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn unregister_action_protocol() -> Result<()> {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    match RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(protocol_key()) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(windows)]
@@ -86,6 +113,16 @@ pub fn set_autostart(_enable: bool) -> Result<()> {
 
 #[cfg(not(windows))]
 pub fn unregister_app_id(_: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn register_action_protocol() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn unregister_action_protocol() -> Result<()> {
     Ok(())
 }
 

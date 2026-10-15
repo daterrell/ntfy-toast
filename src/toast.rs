@@ -1,3 +1,4 @@
+use crate::action::HttpAction;
 use crate::config::Config;
 use crate::message::{tag_emoji, Message};
 use crate::paths;
@@ -99,10 +100,17 @@ pub fn build(n: &Notice, cfg: &Config, icon: Option<&Path>, image: Option<&Path>
             .then(|| format!("{}/{}", n.server, m.topic))
     });
 
+    let tag = truncate(m.toast_tag(), 64);
+    let group = truncate(&m.topic, 64);
+
     let mut buttons: Vec<(String, String)> = Vec::new();
     for a in &m.actions {
         match (a.action.as_str(), &a.url) {
             ("view", Some(url)) => buttons.push((a.label.clone(), url.clone())),
+            ("http", Some(url)) => {
+                let uri = HttpAction::from_message(a, url, &tag, &group).to_uri();
+                buttons.push((a.label.clone(), uri));
+            }
             (kind, _) => debug!("action {:?} ({kind}) not supported on Windows", a.label),
         }
     }
@@ -183,8 +191,8 @@ pub fn build(n: &Notice, cfg: &Config, icon: Option<&Path>, image: Option<&Path>
     Toast {
         xml,
         fallback_xml,
-        tag: truncate(&m.id, 64),
-        group: truncate(&m.topic, 64),
+        tag,
+        group,
         silent_popup: p == 1,
     }
 }
@@ -296,6 +304,13 @@ pub fn run(rx: Receiver<Notice>, shared: SharedConfig) {
         let Some((_, notifier)) = &notifier else {
             continue;
         };
+        if matches!(n.msg.event.as_str(), "message_clear" | "message_delete") {
+            let (tag, group) = (truncate(n.msg.toast_tag(), 64), truncate(&n.msg.topic, 64));
+            if let Err(e) = platform::remove(&cfg.app_id, &tag, &group) {
+                debug!("could not remove toast {group}/{tag}: {e:#}");
+            }
+            continue;
+        }
         let toast = prepare(&http, &n, &cfg);
         if let Err(e) = notifier.show(&toast, &toast.xml) {
             warn!("toast rejected ({e:#}); retrying without extras");
@@ -340,6 +355,18 @@ pub mod platform {
             Ok(())
         }
     }
+
+    /// Remove a toast from the screen and the notification center.
+    pub fn remove(app_id: &str, tag: &str, group: &str) -> Result<()> {
+        ToastNotificationManager::History()?
+            .RemoveGroupedTagWithId(
+                &HSTRING::from(tag),
+                &HSTRING::from(group),
+                &HSTRING::from(app_id),
+            )
+            .context("ToastNotificationHistory::Remove")?;
+        Ok(())
+    }
 }
 
 /// Non-Windows builds print toasts instead, so the daemon can be developed and tested anywhere.
@@ -359,6 +386,11 @@ pub mod platform {
             println!("TOAST [{}/{} quiet={}] {xml}", t.group, t.tag, t.silent_popup);
             Ok(())
         }
+    }
+
+    pub fn remove(_app_id: &str, tag: &str, group: &str) -> Result<()> {
+        println!("REMOVE [{group}/{tag}]");
+        Ok(())
     }
 }
 
@@ -418,11 +450,15 @@ mod tests {
                         action: "view".into(),
                         label: "Open".into(),
                         url: Some("https://cam".into()),
+                        ..Default::default()
                     },
                     Action {
                         action: "http".into(),
                         label: "Disarm".into(),
                         url: Some("https://api".into()),
+                        body: Some("off".into()),
+                        clear: true,
+                        ..Default::default()
                     },
                 ],
                 attachment: Some(Attachment {
@@ -442,8 +478,38 @@ mod tests {
         assert!(t.xml.contains(r#"launch="https://cam/1?a=1&amp;b=2""#));
         assert!(t.xml.contains(r#"scenario="urgent""#));
         assert!(t.xml.contains(r#"content="Open""#));
-        assert!(!t.xml.contains("Disarm"));
+        assert!(t.xml.contains(r#"content="Disarm" activationType="protocol" arguments="ntfy-toast-action:"#));
         assert!(t.xml.contains(r#"content="Open log.txt""#));
+    }
+
+    #[test]
+    fn http_button_targets_sequence_tag() {
+        let t = build(
+            &notice(Message {
+                id: "m1".into(),
+                sequence_id: Some("req1".into()),
+                event: "message".into(),
+                topic: "Claude".into(),
+                actions: vec![Action {
+                    action: "http".into(),
+                    label: "Allow".into(),
+                    url: Some("https://ntfy/reply".into()),
+                    body: Some("req1 allow".into()),
+                    clear: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            &cfg(),
+            None,
+            None,
+        );
+        assert_eq!(t.tag, "req1");
+        let uri = t.xml.split(r#"arguments=""#).nth(1).unwrap().split('"').next().unwrap();
+        let a = HttpAction::from_uri(uri).unwrap();
+        assert_eq!((a.method.as_str(), a.url.as_str()), ("POST", "https://ntfy/reply"));
+        assert_eq!((a.body.as_str(), a.tag.as_str(), a.group.as_str()), ("req1 allow", "req1", "Claude"));
+        assert!(a.clear);
     }
 
     #[test]
