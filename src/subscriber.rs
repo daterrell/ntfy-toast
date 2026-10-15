@@ -214,6 +214,21 @@ pub fn run(
                                 return;
                             }
                         }
+                        "message_clear" | "message_delete" => {
+                            since = Some(msg.id.clone());
+                            state.set(&key, &msg.id);
+                            debug!("[{label}] {} for {}", msg.event, msg.toast_tag());
+                            let notice = Notice {
+                                msg,
+                                server: server.clone(),
+                                auth: auth.clone(),
+                                source_name: sub.name.clone(),
+                                topic_name: None,
+                            };
+                            if tx.send(notice).is_err() {
+                                return;
+                            }
+                        }
                         other => debug!("[{label}] ignoring event {other}"),
                     }
                 }

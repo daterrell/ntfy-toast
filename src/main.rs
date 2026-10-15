@@ -1,6 +1,7 @@
 // No console window when started from Explorer or the Run key.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod action;
 mod config;
 mod daemon;
 mod message;
@@ -12,7 +13,7 @@ mod toast;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::Config;
-use log::{error, LevelFilter};
+use log::{error, info, LevelFilter};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -60,6 +61,9 @@ enum Command {
     },
     /// Print config, log and data locations
     Paths,
+    /// Run an http action button (launched by Windows for ntfy-toast-action: URIs)
+    #[command(hide = true)]
+    Action { uri: String },
 }
 
 struct Logger {
@@ -160,6 +164,23 @@ fn register(app_id: &str, display_name: &str) {
     if let Err(e) = system::register_app_id(app_id, display_name, &icon) {
         error!("could not register notification identity: {e:#}");
     }
+    if let Err(e) = system::register_action_protocol() {
+        error!("could not register action buttons: {e:#}");
+    }
+}
+
+/// Send an http action button's request, then clear its toast if asked to.
+fn run_action(cfg: &Config, uri: &str) -> Result<()> {
+    let a = action::HttpAction::from_uri(uri)?;
+    info!("action: {} {}", a.method, a.url);
+    if let Err(e) = a.send() {
+        let _ = show_direct(cfg, "Action failed", &format!("{e:#}"), 4, &a.group);
+        return Err(e);
+    }
+    if a.clear {
+        toast::platform::remove(&cfg.app_id, &a.tag, &a.group)?;
+    }
+    Ok(())
 }
 
 /// Show one toast synchronously (used by `test` and for startup problems).
@@ -190,7 +211,7 @@ fn main() {
     let cli = Cli::parse();
     let config_path = cli.config.clone().unwrap_or_else(paths::default_config_file);
     let command = cli.command.unwrap_or(Command::Run);
-    init_logging(cli.verbose, matches!(command, Command::Run));
+    init_logging(cli.verbose, matches!(command, Command::Run | Command::Action { .. }));
 
     let result = match command {
         Command::Run => daemon::run(config_path),
@@ -221,6 +242,7 @@ fn main() {
             system::set_autostart(false)?;
             let cfg = Config::load(&config_path).or_else(|_| Config::parse(config::SAMPLE))?;
             system::unregister_app_id(&cfg.app_id)?;
+            system::unregister_action_protocol()?;
             println!("Removed autostart and notification registration.");
             println!("A running instance keeps going until you sign out or run:");
             println!("  taskkill /im ntfy-toast.exe");
@@ -236,6 +258,10 @@ fn main() {
             show_direct(&cfg, &title, &message, priority.clamp(1, 5), "test")?;
             println!("Test notification sent.");
             Ok(())
+        })(),
+        Command::Action { uri } => (|| {
+            let cfg = Config::load(&config_path).or_else(|_| Config::parse(config::SAMPLE))?;
+            run_action(&cfg, &uri)
         })(),
         Command::Paths => {
             println!("config: {}", config_path.display());

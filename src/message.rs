@@ -1,10 +1,13 @@
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 /// One line of ntfy's `/<topics>/json` stream.
 /// See https://docs.ntfy.sh/subscribe/api/#json-message-format
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Message {
     pub id: String,
+    /// Set when the publisher may later update, clear or delete this notification.
+    pub sequence_id: Option<String>,
     #[serde(default)]
     pub time: i64,
     pub event: String,
@@ -22,11 +25,18 @@ pub struct Message {
     pub attachment: Option<Attachment>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Action {
     pub action: String,
     pub label: String,
     pub url: Option<String>,
+    /// `http` actions only.
+    pub method: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    pub body: Option<String>,
+    #[serde(default)]
+    pub clear: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,6 +51,11 @@ pub struct Attachment {
 impl Message {
     pub fn priority(&self) -> u8 {
         self.priority.unwrap_or(3).clamp(1, 5)
+    }
+
+    /// Identifies the toast; later updates, clears and deletes share the sequence id.
+    pub fn toast_tag(&self) -> &str {
+        self.sequence_id.as_deref().unwrap_or(&self.id)
     }
 }
 
@@ -137,7 +152,22 @@ mod tests {
         let m: Message = serde_json::from_str(line).unwrap();
         assert_eq!(m.priority(), 5);
         assert_eq!(m.actions.len(), 2);
+        assert!(m.actions[0].clear);
+        assert_eq!(m.actions[1].method, None);
+        assert_eq!(m.toast_tag(), "sPs71M8A2T");
         assert_eq!(m.attachment.unwrap().mime.as_deref(), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn parses_http_action_and_sequence_id() {
+        let line = r#"{"id":"a","time":1,"event":"message","topic":"t","sequence_id":"req1","actions":[{"action":"http","label":"Allow","url":"https://x/reply","method":"PUT","headers":{"X-A":"1"},"body":"req1 allow","clear":true}]}"#;
+        let m: Message = serde_json::from_str(line).unwrap();
+        assert_eq!(m.toast_tag(), "req1");
+        let a = &m.actions[0];
+        assert_eq!(a.method.as_deref(), Some("PUT"));
+        assert_eq!(a.headers["X-A"], "1");
+        assert_eq!(a.body.as_deref(), Some("req1 allow"));
+        assert!(a.clear);
     }
 
     #[test]
