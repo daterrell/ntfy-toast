@@ -22,6 +22,22 @@ catch_up_on_start = false
 [[subscription]]
 topic = "change-me-to-your-topic"
 
+# Self-update. ntfy-toast checks for a new release at startup and whenever the release
+# topic below announces one, then shows a notification with an Install button.
+[update]
+# "notify" (ask first), "auto" (install right away), or "off".
+mode = "notify"
+# Where releases are published: a Forgejo/Gitea server, or https://github.com.
+server = "https://forgejo.terrell.ltd"
+repo = "dave/ntfy-toast"
+# Forgejo access token with read access to the repo (needed if the server requires
+# sign-in). Without one, the public GitHub releases below are used instead.
+# token = "..."
+github_repo = "daterrell/ntfy-toast"
+# ntfy topic that CI posts to when a release is published, for an instant check.
+# Set to "" to rely on the startup check only.
+topic = "https://ntfy.terrell.ltd/ntfy-toast-releases"
+
 # Self-hosted server with access control, several topics, and a priority filter.
 # A topic can be just its id, or `{ id = "...", name = "..." }` to show a friendlier
 # name on notifications (handy for random-looking topic ids):
@@ -51,6 +67,65 @@ pub struct Config {
     pub catch_up_on_start: bool,
     #[serde(default, rename = "subscription")]
     pub subscriptions: Vec<Subscription>,
+    #[serde(default)]
+    pub update: UpdateConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UpdateConfig {
+    pub mode: UpdateMode,
+    /// Forgejo/Gitea base URL, or `https://github.com`.
+    pub server: String,
+    /// `owner/name` on `server`.
+    pub repo: String,
+    /// Access token for `server` (Forgejo needs one when it requires sign-in).
+    pub token: Option<String>,
+    /// GitHub `owner/name` to use when `server` is Forgejo and no token is set; "" disables.
+    pub github_repo: String,
+    /// ntfy topic URL that announces new releases; "" disables push checks.
+    pub topic: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateMode {
+    /// Show a notification with an Install button.
+    #[default]
+    Notify,
+    /// Install as soon as a release is found.
+    Auto,
+    Off,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        UpdateConfig {
+            mode: UpdateMode::Notify,
+            server: "https://forgejo.terrell.ltd".into(),
+            repo: "dave/ntfy-toast".into(),
+            token: None,
+            github_repo: "daterrell/ntfy-toast".into(),
+            topic: "https://ntfy.terrell.ltd/ntfy-toast-releases".into(),
+        }
+    }
+}
+
+impl UpdateConfig {
+    /// The release topic split into (server, topic id), if push checks are enabled.
+    pub fn topic_parts(&self) -> Option<(String, String)> {
+        if self.mode == UpdateMode::Off || self.topic.is_empty() {
+            return None;
+        }
+        let (server, topic) = self.topic.rsplit_once('/')?;
+        Some((server.to_string(), topic.to_string()))
+    }
+}
+
+fn valid_topic_id(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= 64
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
@@ -128,6 +203,28 @@ impl Config {
     pub fn parse(text: &str) -> Result<Config> {
         let mut cfg: Config = toml::from_str(text)?;
         cfg.default_server = normalize_server(&cfg.default_server)?;
+        let u = &mut cfg.update;
+        u.server = normalize_server(&u.server).context("in [update] server")?;
+        for (key, repo) in [("repo", &u.repo), ("github_repo", &u.github_repo)] {
+            let ok = repo.split('/').filter(|p| !p.is_empty()).count() == 2;
+            if !ok && !(key == "github_repo" && repo.is_empty()) {
+                bail!("[update] {key} must look like \"owner/name\", not {repo:?}");
+            }
+        }
+        if u.token.as_deref().is_some_and(|t| t.trim().is_empty()) {
+            u.token = None;
+        }
+        if !u.topic.is_empty() {
+            let topic = u.topic.trim().trim_end_matches('/').to_string();
+            let parts = topic
+                .split_once("://")
+                .and_then(|(_, rest)| rest.split_once('/'))
+                .filter(|(host, id)| !host.is_empty() && valid_topic_id(id));
+            if !(topic.starts_with("https://") || topic.starts_with("http://")) || parts.is_none() {
+                bail!("[update] topic must be a URL like \"https://ntfy.sh/my-releases\", not {topic:?}");
+            }
+            u.topic = topic;
+        }
         if cfg.subscriptions.is_empty() {
             bail!("no [[subscription]] entries");
         }
@@ -257,6 +354,48 @@ mod tests {
         assert!(Config::parse("[[subscription]]\ntopic = \"bad topic\"").is_err());
         assert!(Config::parse("[[subscription]]\ntopic = \"a\"\nusername = \"u\"").is_err());
         assert!(Config::parse("").is_err());
+    }
+
+    #[test]
+    fn update_defaults_and_overrides() {
+        let cfg = Config::parse("[[subscription]]\ntopic = \"a\"").unwrap();
+        assert_eq!(cfg.update, UpdateConfig::default());
+        assert_eq!(
+            cfg.update.topic_parts(),
+            Some(("https://ntfy.terrell.ltd".into(), "ntfy-toast-releases".into()))
+        );
+
+        let cfg = Config::parse(
+            r#"
+            [[subscription]]
+            topic = "a"
+            [update]
+            mode = "auto"
+            server = "github.com/"
+            repo = "someone/ntfy-toast"
+            token = " "
+            topic = ""
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.update.mode, UpdateMode::Auto);
+        assert_eq!(cfg.update.server, "https://github.com");
+        assert_eq!(cfg.update.token, None);
+        assert_eq!(cfg.update.topic_parts(), None);
+
+        let off = Config::parse("[[subscription]]\ntopic = \"a\"\n[update]\nmode = \"off\"").unwrap();
+        assert_eq!(off.update.topic_parts(), None);
+
+        for bad in [
+            "mode = \"sometimes\"",
+            "repo = \"just-a-name\"",
+            "topic = \"ntfy.sh/x\"",
+            "topic = \"https://ntfy.sh/bad topic\"",
+            "colour = \"teal\"",
+        ] {
+            let text = format!("[[subscription]]\ntopic = \"a\"\n[update]\n{bad}");
+            assert!(Config::parse(&text).is_err(), "{bad}");
+        }
     }
 
     #[test]

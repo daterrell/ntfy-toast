@@ -48,6 +48,7 @@ running `install`, because autostart points at the exe's current location.
 | `install`   | Add an HKCU `Run` entry so it starts at login, then start it. |
 | `uninstall` | Remove the `Run` entry and the notification registration. Stop a running copy with `taskkill /im ntfy-toast.exe`. |
 | `paths`     | Print the config, log, state, and cache locations. |
+| `update`    | Install the latest release now (`--check` only reports whether there is one). |
 
 Global options are `--config <file>` and `-v/--verbose` for debug logging.
 
@@ -86,6 +87,39 @@ already running resume from the last message seen, so nothing is missed during a
 If an edit has a mistake, a notification shows the error and the previous settings
 stay in effect until the file is fixed.
 
+## Self-update
+
+ntfy-toast keeps itself up to date. It checks for a new release 30 seconds after it
+starts, and again whenever the release topic announces one (CI posts there when it
+publishes a release), so running copies hear about updates within seconds. Then it shows
+**"ntfy-toast X is available"** with an **Install** button. Installing:
+
+1. downloads the new `ntfy-toast.exe` and checks it against the release's SHA-256,
+2. runs the download once (`--version`) to make sure it's the expected version,
+3. swaps it in place of the running exe (the old one is kept as `ntfy-toast.exe.old`
+   until the next start), and
+4. restarts with the same settings, then confirms with an "updated" notification.
+
+If any step fails, the current version keeps running and a notification says why.
+
+```toml
+[update]
+mode = "notify"     # "notify" (Install button), "auto" (install right away), or "off"
+server = "https://forgejo.terrell.ltd"   # a Forgejo/Gitea server, or https://github.com
+repo = "dave/ntfy-toast"
+token = "..."       # Forgejo token with read access to the repo
+github_repo = "daterrell/ntfy-toast"    # used when there's no token; "" to disable
+topic = "https://ntfy.terrell.ltd/ntfy-toast-releases"   # "" for startup checks only
+```
+
+The defaults point at `forgejo.terrell.ltd`. That server requires sign-in, so add a
+token: in Forgejo, **Settings → Applications → Generate new token**, with
+**repository: Read** permission. Without a token, ntfy-toast reads the public GitHub
+releases instead, which carry the same files. The token is only sent to `server`.
+
+A message on the release topic only prompts a check; what gets installed always comes
+from the release server and has to match its checksum.
+
 ## How ntfy features map to toasts
 
 | ntfy | Toast |
@@ -114,7 +148,8 @@ stay in effect until the file is fixed.
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\ntfy-toast` (autostart)
 
 Set `NTFY_TOAST_DATA_DIR` to use a different data directory, for example to run a second,
-separate copy for testing (each data directory gets its own single-instance lock).
+separate copy for testing (each data directory gets its own single-instance lock). Such a
+copy leaves the `ntfy-toast-action:` button handler to the main install.
 
 ## Troubleshooting
 
@@ -152,13 +187,18 @@ attached to the workflow run as the `ntfy-toast-windows-x64` artifact.
 To publish a release, do either of these. There's no version number to edit first: the
 tag (`v1.2.3`) sets the version the exe is built with.
 
-- **On GitHub:** Releases → *Draft a new release* → choose a new tag like `v0.3.0` →
+- **On Forgejo:** Releases → *New release* → choose a new tag like `v0.5.0` →
   *Publish release*. The exe and its checksum are attached a couple of minutes later.
 - **From the command line:**
   ```sh
-  git tag v0.3.0
-  git push origin v0.3.0
+  git tag v0.5.0
+  git push origin v0.5.0
   ```
   This creates the release, with install notes and a changelog.
 
-Tags that aren't version numbers (like `Release`) fail with an error instead of publishing.
+Either way, CI publishes the exe on both Forgejo and GitHub, then posts to the release
+topic so running copies offer the update right away. Tags that aren't version numbers
+(like `Release`) fail with an error instead of publishing.
+
+The Forgejo release is made with the job's own token; if that lacks permission, add a
+`FORGEJO_RELEASE_TOKEN` repository secret (a token with repository write access).

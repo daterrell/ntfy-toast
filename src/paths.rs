@@ -27,6 +27,10 @@ pub fn data_dir() -> PathBuf {
     }
 }
 
+pub fn data_dir_overridden() -> bool {
+    std::env::var_os(DATA_DIR_ENV).is_some_and(|d| !d.is_empty())
+}
+
 /// Name of the single-instance lock: one daemon per data directory.
 pub fn instance_name() -> String {
     use std::hash::{Hash, Hasher};
@@ -38,6 +42,11 @@ pub fn instance_name() -> String {
         }
         _ => r"Local\ntfy-toast-daemon".to_string(),
     }
+}
+
+/// Named event a running daemon listens on for "install the update now".
+pub fn update_event_name() -> String {
+    format!("{}-update", instance_name())
 }
 
 pub fn default_config_file() -> PathBuf {

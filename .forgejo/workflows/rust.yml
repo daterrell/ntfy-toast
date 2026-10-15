@@ -84,7 +84,12 @@ jobs:
       # Releases are published on GitHub. Forgejo push-mirrors the repo there, tags included.
       GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
       GH_REPO: daterrell/ntfy-toast
+      RELEASE_TOPIC: https://ntfy.terrell.ltd/ntfy-toast-releases
     steps:
+      # First: checkout cleans the workspace, which would delete the downloaded exe.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .forgejo/scripts
       - uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
           name: ntfy-toast-windows-x64
@@ -101,7 +106,21 @@ jobs:
           done
           echo "::error::$GITHUB_REF_NAME didn't reach github.com/$GH_REPO; check the repo's push mirror."
           exit 1
-      - name: Publish release
+      - name: Write release notes
+        run: |
+          cat > notes.md <<'EOF'
+          ## Install
+
+          1. Download `ntfy-toast.exe` below and move it somewhere permanent, e.g. `%LOCALAPPDATA%\Programs\ntfy-toast\`.
+          2. Run `ntfy-toast.exe init`, then edit `%APPDATA%\ntfy-toast\config.toml` to set your topics.
+          3. Run `ntfy-toast.exe install` to start it now and at every login.
+
+          Already installed? ntfy-toast offers this update itself (notification with an Install button), or run `ntfy-toast.exe update`.
+
+          The exe isn't code-signed, so Windows SmartScreen may warn on first run: choose **More info → Run anyway**.
+          Verify the download with `ntfy-toast.exe.sha256` (`Get-FileHash ntfy-toast.exe`).
+          EOF
+      - name: Publish GitHub release
         run: |
           files=(dist/ntfy-toast.exe dist/ntfy-toast.exe.sha256)
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
@@ -111,15 +130,21 @@ jobs:
             gh release create "$GITHUB_REF_NAME" "${files[@]}" --verify-tag \
               --title "ntfy-toast $GITHUB_REF_NAME" \
               --generate-notes \
-              --notes "$(cat <<'EOF'
-          ## Install
-
-          1. Download `ntfy-toast.exe` below and move it somewhere permanent, e.g. `%LOCALAPPDATA%\Programs\ntfy-toast\`.
-          2. Run `ntfy-toast.exe init`, then edit `%APPDATA%\ntfy-toast\config.toml` to set your topics.
-          3. Run `ntfy-toast.exe install` to start it now and at every login.
-
-          The exe isn't code-signed, so Windows SmartScreen may warn on first run: choose **More info → Run anyway**.
-          Verify the download with `ntfy-toast.exe.sha256` (`Get-FileHash ntfy-toast.exe`).
-          EOF
-          )"
+              --notes-file notes.md
           fi
+      - name: Publish Forgejo release
+        # Self-update checks Forgejo first. Uses FORGEJO_RELEASE_TOKEN if set, else the job token.
+        env:
+          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          TOKEN: ${{ secrets.FORGEJO_RELEASE_TOKEN || github.token }}
+          TAG: ${{ github.ref_name }}
+          TITLE: ntfy-toast ${{ github.ref_name }}
+          NOTES_FILE: notes.md
+        run: bash .forgejo/scripts/forgejo-release.sh dist/ntfy-toast.exe dist/ntfy-toast.exe.sha256
+      - name: Announce on the release topic
+        # Running copies subscribe to this topic and check for the update right away.
+        # A failure here doesn't undo the release; copies also check at startup.
+        run: |
+          curl -sS --fail-with-body --max-time 20 -H "Title: ntfy-toast $GITHUB_REF_NAME released" -H "Tags: package" \
+            -d "Install it from the notification, or run: ntfy-toast update" "$RELEASE_TOPIC" \
+            || echo "::warning::Couldn't post to $RELEASE_TOPIC; running copies will find the update at their next start."

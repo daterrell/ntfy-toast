@@ -86,17 +86,65 @@ pub fn unregister_app_id(app_id: &str) -> Result<()> {
     }
 }
 
-/// Returns false if another daemon is already running for this user session.
+/// Returns false if another daemon is already running for this user session. With `wait`,
+/// keeps trying that long first (a restart after an update overlaps the old process).
 #[cfg(windows)]
-pub fn acquire_single_instance(name: &str) -> bool {
+pub fn acquire_single_instance(name: &str, wait: std::time::Duration) -> bool {
     use windows::core::HSTRING;
-    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        unsafe {
+            match CreateMutexW(None, true, &HSTRING::from(name)) {
+                Ok(handle) if GetLastError() == ERROR_ALREADY_EXISTS => {
+                    let _ = CloseHandle(handle);
+                }
+                // The handle is intentionally leaked: it must live as long as the process.
+                Ok(_handle) => return true,
+                Err(_) => return true,
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Call `on_signal` each time another process signals the named event (see `signal`).
+/// Blocks forever; run it on its own thread.
+#[cfg(windows)]
+pub fn wait_for_signals(name: &str, mut on_signal: impl FnMut()) {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+    let event = match unsafe { CreateEventW(None, false, false, &HSTRING::from(name)) } {
+        Ok(e) => e,
+        Err(e) => {
+            log::warn!("could not create {name}: {e}");
+            return;
+        }
+    };
+    while unsafe { WaitForSingleObject(event, INFINITE) } == WAIT_OBJECT_0 {
+        on_signal();
+    }
+}
+
+/// Signal a running daemon's named event. Returns false if no daemon is listening.
+#[cfg(windows)]
+pub fn signal(name: &str) -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
     unsafe {
-        match CreateMutexW(None, true, &HSTRING::from(name)) {
-            // The handle is intentionally leaked: it must live as long as the process.
-            Ok(_handle) => GetLastError() != ERROR_ALREADY_EXISTS,
-            Err(_) => true,
+        match OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(name)) {
+            Ok(event) => {
+                let ok = SetEvent(event).is_ok();
+                let _ = CloseHandle(event);
+                ok
+            }
+            Err(_) => false,
         }
     }
 }
@@ -127,6 +175,14 @@ pub fn unregister_action_protocol() -> Result<()> {
 }
 
 #[cfg(not(windows))]
-pub fn acquire_single_instance(_name: &str) -> bool {
+pub fn acquire_single_instance(_name: &str, _wait: std::time::Duration) -> bool {
     true
+}
+
+#[cfg(not(windows))]
+pub fn wait_for_signals(_name: &str, _on_signal: impl FnMut()) {}
+
+#[cfg(not(windows))]
+pub fn signal(_name: &str) -> bool {
+    false
 }
