@@ -3,14 +3,16 @@
 # given files, replacing any with the same name. ntfy-toast's self-update reads these.
 #
 # Env: API (e.g. https://forgejo.example/api/v1/repos/owner/name), TOKEN, TAG, TITLE,
-#      NOTES_FILE (optional), PRERELEASE (optional, "true" for a pre-release).
+#      NOTES_FILE (optional), PRERELEASE (optional, "true" for a pre-release),
+#      TARGET (optional: commit to create the tag at, if it doesn't exist yet).
 set -euo pipefail
 
 auth=(-H "Authorization: token $TOKEN")
 
 if ! rel=$(curl -sf "${auth[@]}" "$API/releases/tags/$TAG"); then
   body=$(jq -n --arg tag "$TAG" --arg name "$TITLE" --rawfile notes "${NOTES_FILE:-/dev/null}" \
-    --argjson pre "${PRERELEASE:-false}" '{tag_name: $tag, name: $name, body: $notes, prerelease: $pre}')
+    --argjson pre "${PRERELEASE:-false}" --arg target "${TARGET:-}" \
+    '{tag_name: $tag, name: $name, body: $notes, prerelease: $pre} + (if $target == "" then {} else {target_commitish: $target} end)')
   rel=$(curl -sS --fail-with-body "${auth[@]}" -H "Content-Type: application/json" -d "$body" "$API/releases")
   echo "created Forgejo release $TAG"
 fi

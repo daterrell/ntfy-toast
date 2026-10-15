@@ -105,6 +105,7 @@ If any step fails, the current version keeps running and a notification says why
 ```toml
 [update]
 mode = "notify"     # "notify" (Install button), "auto" (install right away), or "off"
+channel = "stable"  # "stable" (formal releases), or "dev" (also every merge to main)
 server = "https://forgejo.terrell.ltd"   # a Forgejo/Gitea server, or https://github.com
 repo = "dave/ntfy-toast"
 token = "..."       # Forgejo token with read access to the repo
@@ -120,6 +121,12 @@ releases instead, which carry the same files. The token is only sent to `server`
 A message on the release topic only prompts a check; what gets installed always comes
 from the release server and has to match its checksum.
 
+With `channel = "dev"`, ntfy-toast also offers the development build CI publishes for
+every change merged to `main` (see [Releasing](#releasing)), and moves on to the next
+formal release when there's one. Development builds are published on Forgejo only, so
+the dev channel needs the token; without one it stays on formal releases.
+`ntfy-toast update --check` shows which channel is in effect.
+
 ## How ntfy features map to toasts
 
 | ntfy | Toast |
@@ -133,7 +140,8 @@ from the release server and has to match its checksum.
 | Priority 5 (urgent) | Same as 4, plus the `urgent` scenario (shown as an important notification on Windows 11; ignored on Windows 10) |
 | Click URL | Opens when the toast is clicked |
 | `view` actions | Buttons that open the URL (up to 5) |
-| `http` / `broadcast` actions | Not supported (they'd need a COM activator); skipped |
+| `http` actions | Buttons that send the request in the background (no browser window) |
+| `broadcast` actions | Android-only; skipped |
 | Icon | Downloaded and shown as the toast's app logo |
 | Image attachment (up to 3 MB) | Downloaded and shown inline |
 | Other attachment | An "Open <file>" button |
@@ -179,26 +187,40 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 `cargo test` runs on any platform. Off Windows, toasts are printed to stdout instead of shown.
 
+The version comes from the repo's tags (`git describe`, in `build.rs`), never from
+Cargo.toml, whose version is a placeholder. A build of tag `v0.6.0` is `0.6.0`; three
+commits later it's `0.6.1-dev.3+g1a2b3c4`, which sorts after 0.6.0 and before the next
+release. Outside a git checkout it falls back to Cargo.toml's `0.0.0`.
+
 ## Releasing
 
-Every push and pull request to `main` runs the tests and builds the exe; the build is
-attached to the workflow run as the `ntfy-toast-windows-x64` artifact.
+CI (`.forgejo/workflows/rust.yml`) does three things:
 
-To publish a release, do either of these. There's no version number to edit first: the
-tag (`v1.2.3`) sets the version the exe is built with.
+- **Pull requests:** run the tests and build the exe. The build is attached to the
+  workflow run as the `ntfy-toast-windows-x64` artifact.
+- **Every merge to `main`:** also publishes a **development build**, a Forgejo
+  pre-release titled like *Development build 0.6.1-dev.3* (tag `v0.6.1-dev.3`), with the
+  merged change in its notes. Only the newest 2 are kept; older ones and their tags are
+  deleted. Copies with `channel = "dev"` are told about it on the release topic.
+- **A version tag:** publishes the **formal release** *ntfy-toast 0.6.0* on Forgejo
+  and GitHub, with a *What's new* list of the pull requests merged since the previous
+  release, then announces it on the release topic so running copies offer it right away.
 
-- **On Forgejo:** Releases → *New release* → choose a new tag like `v0.5.0` →
-  *Publish release*. The exe and its checksum are attached a couple of minutes later.
+There's no version number to edit first: the tag is the version. To publish a formal
+release, do either of these:
+
+- **On Forgejo:** Releases → *New release* → choose a new tag like `v0.6.0` on `main` →
+  *Publish release*. The exe and its checksum are attached a few minutes later. Notes
+  you write there stay on the Forgejo release; GitHub gets the generated ones.
 - **From the command line:**
   ```sh
-  git tag v0.5.0
-  git push origin v0.5.0
+  git tag v0.6.0 origin/main
+  git push origin v0.6.0
   ```
-  This creates the release, with install notes and a changelog.
 
-Either way, CI publishes the exe on both Forgejo and GitHub, then posts to the release
-topic so running copies offer the update right away. Tags that aren't version numbers
-(like `Release`) fail with an error instead of publishing.
+A tag like `v1.0.0-rc.1` publishes a formal pre-release: the dev channel offers it,
+the stable channel waits for `v1.0.0`. Tags that aren't version numbers (like `Release`)
+fail with an error instead of publishing.
 
-The Forgejo release is made with the job's own token; if that lacks permission, add a
+The Forgejo releases are made with the job's own token; if that lacks permission, add a
 `FORGEJO_RELEASE_TOKEN` repository secret (a token with repository write access).

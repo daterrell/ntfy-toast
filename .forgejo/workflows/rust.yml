@@ -1,12 +1,17 @@
 name: Rust
 
+# - pull requests: test and build.
+# - every merge (push) to main: also publish a development build, a Forgejo pre-release
+#   like "Development build 0.6.1-dev.3" (only the newest 2 are kept).
+# - a version tag (v1.2.3), pushed or made with Forgejo's "New release": publish the formal
+#   release "ntfy-toast 1.2.3" on Forgejo and GitHub.
+# The version always comes from git tags (see build.rs); there's nothing to edit.
 on:
   push:
     branches: ["main"]
     tags: ["v*"]
   pull_request:
     branches: ["main"]
-  # Creating a release on Forgejo's website also builds the exe and publishes it to GitHub.
   release:
     types: [published]
   workflow_dispatch:
@@ -22,12 +27,17 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   TARGET: x86_64-pc-windows-gnu
+  RELEASE_TOPIC: https://ntfy.terrell.ltd/ntfy-toast-releases
 
 jobs:
   test:
+    # Development builds' own tags and pre-releases (made by the dev-release job) need no run.
+    if: ${{ !contains(github.ref_name, '-dev.') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -37,9 +47,13 @@ jobs:
 
   build:
     # Cross-compiles from Linux with mingw: the exe is fully standalone (no MSVC runtime).
+    if: ${{ !contains(github.ref_name, '-dev.') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # All history and tags: build.rs works out the version with `git describe`.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ env.TARGET }}
@@ -47,19 +61,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install mingw-w64
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
-      - name: Take version from tag
-        # The tag is the source of truth for releases: v1.2.3 builds version 1.2.3,
-        # whatever Cargo.toml says.
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Tag '$GITHUB_REF_NAME' isn't a version number. Use a tag like v1.2.3."
-            exit 1
-          fi
-          sed -i "0,/^version = \".*\"/s//version = \"$version\"/" Cargo.toml
-          sed -i "/^name = \"ntfy-toast\"$/{n;s/^version = \".*\"/version = \"$version\"/}" Cargo.lock
-          echo "Building ntfy-toast $version"
       - run: cargo clippy --locked --release --target $TARGET -- -D warnings
       - run: cargo build --locked --release --target $TARGET
       - name: Collect binary
@@ -67,6 +68,16 @@ jobs:
           mkdir dist
           cp target/$TARGET/release/ntfy-toast.exe dist/
           cd dist && sha256sum ntfy-toast.exe > ntfy-toast.exe.sha256
+      - name: Version
+        run: |
+          version=$(cat "$(ls -t target/$TARGET/release/build/ntfy-toast-*/out/version.txt | head -1)")
+          echo "$version" > dist/version.txt
+          echo "Built ntfy-toast $version"
+          # A version tag must build exactly that version (this also rejects tags like "Release").
+          if [[ "$GITHUB_REF" == refs/tags/* && "$version" != "${GITHUB_REF_NAME#v}" ]]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' built version $version. Use a version tag like v1.2.3."
+            exit 1
+          fi
       # Forgejo's fork: GitHub's upload/download-artifact v4+ don't work against Forgejo.
       - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         with:
@@ -74,31 +85,90 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-  release:
-    if: startsWith(github.ref, 'refs/tags/')
+  dev-release:
+    # Every merge to main publishes a development build on Forgejo (not GitHub).
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
-      # Releases are published on GitHub. Forgejo push-mirrors the repo there, tags included.
-      GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
-      GH_REPO: daterrell/ntfy-toast
-      RELEASE_TOPIC: https://ntfy.terrell.ltd/ntfy-toast-releases
+      API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+      TOKEN: ${{ secrets.FORGEJO_RELEASE_TOKEN || github.token }}
     steps:
       # First: checkout cleans the workspace, which would delete the downloaded exe.
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: .forgejo/scripts
+          fetch-depth: 2
       - uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
           name: ntfy-toast-windows-x64
           path: dist
+      - name: Publish development build
+        run: |
+          version=$(cat dist/version.txt)
+          version=${version%%+*}   # the tag can't carry the +commit part
+          .forgejo/scripts/release-notes.sh dev "$version" > notes.md
+          TAG="v$version" TITLE="Development build $version" NOTES_FILE=notes.md \
+            PRERELEASE=true TARGET="$GITHUB_SHA" \
+            .forgejo/scripts/forgejo-release.sh dist/ntfy-toast.exe dist/ntfy-toast.exe.sha256
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Keep only the newest 2 development builds
+        run: KEEP=2 .forgejo/scripts/prune-dev-releases.sh
+      - name: Announce on the release topic
+        # Tagged "dev": copies on the stable channel ignore it.
+        run: |
+          curl -sS --fail-with-body --max-time 20 -H "Title: ntfy-toast development build $VERSION" \
+            -H "Tags: dev" -H "Priority: low" \
+            -d "For copies with channel = \"dev\": install it from the notification, or run: ntfy-toast update" \
+            "$RELEASE_TOPIC" \
+            || echo "::warning::Couldn't post to $RELEASE_TOPIC; dev copies will find the build at their next start."
+
+  release:
+    # The formal release for a version tag.
+    if: startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-dev.')
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      # Forgejo push-mirrors the repo to GitHub, tags included.
+      GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+      GH_REPO: daterrell/ntfy-toast
+      API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+      TOKEN: ${{ secrets.FORGEJO_RELEASE_TOKEN || github.token }}
+    steps:
+      # First: checkout cleans the workspace, which would delete the downloaded exe.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: ntfy-toast-windows-x64
+          path: dist
+      - name: Release details
+        run: |
+          version=$(cat dist/version.txt)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          # v1.0.0-rc.1 and the like are formal pre-releases.
+          if [[ "$version" == *-* ]]; then echo "PRERELEASE=true" >> "$GITHUB_ENV"; else echo "PRERELEASE=false" >> "$GITHUB_ENV"; fi
+          .forgejo/scripts/release-notes.sh formal "$GITHUB_REF_NAME" > notes.md
+          cat notes.md
       - name: Install gh
         run: |
           curl -fsSL https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_amd64.tar.gz | tar xz -C /tmp
           sudo install /tmp/gh_2.102.0_linux_amd64/bin/gh /usr/local/bin/gh
+      - name: Already published?
+        # A website release fires both a release and a tag push; the second run has nothing to do.
+        run: |
+          has_exe() { jq -e '[.assets[]?.name] | index("ntfy-toast.exe")' >/dev/null; }
+          if curl -sf -H "Authorization: token $TOKEN" "$API/releases/tags/$GITHUB_REF_NAME" | has_exe &&
+             gh api "repos/$GH_REPO/releases/tags/$GITHUB_REF_NAME" 2>/dev/null | has_exe; then
+            echo "ntfy-toast $VERSION is already published on Forgejo and GitHub."
+            echo "PUBLISHED=true" >> "$GITHUB_ENV"
+          fi
       - name: Wait for the push mirror to bring the tag to GitHub
+        if: env.PUBLISHED != 'true'
         run: |
           for _ in $(seq 60); do
             gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" --silent 2>/dev/null && exit 0
@@ -106,45 +176,32 @@ jobs:
           done
           echo "::error::$GITHUB_REF_NAME didn't reach github.com/$GH_REPO; check the repo's push mirror."
           exit 1
-      - name: Write release notes
-        run: |
-          cat > notes.md <<'EOF'
-          ## Install
-
-          1. Download `ntfy-toast.exe` below and move it somewhere permanent, e.g. `%LOCALAPPDATA%\Programs\ntfy-toast\`.
-          2. Run `ntfy-toast.exe init`, then edit `%APPDATA%\ntfy-toast\config.toml` to set your topics.
-          3. Run `ntfy-toast.exe install` to start it now and at every login.
-
-          Already installed? ntfy-toast offers this update itself (notification with an Install button), or run `ntfy-toast.exe update`.
-
-          The exe isn't code-signed, so Windows SmartScreen may warn on first run: choose **More info → Run anyway**.
-          Verify the download with `ntfy-toast.exe.sha256` (`Get-FileHash ntfy-toast.exe`).
-          EOF
       - name: Publish GitHub release
+        if: env.PUBLISHED != 'true'
         run: |
           files=(dist/ntfy-toast.exe dist/ntfy-toast.exe.sha256)
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             # Made on the website (or re-run): keep its title and notes, attach the exe.
             gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" "${files[@]}" --verify-tag \
-              --title "ntfy-toast $GITHUB_REF_NAME" \
-              --generate-notes \
-              --notes-file notes.md
+            pre=(); [ "$PRERELEASE" = true ] && pre=(--prerelease)
+            gh release create "$GITHUB_REF_NAME" "${files[@]}" --verify-tag "${pre[@]}" \
+              --title "ntfy-toast $VERSION" --notes-file notes.md
           fi
       - name: Publish Forgejo release
         # Self-update checks Forgejo first. Uses FORGEJO_RELEASE_TOKEN if set, else the job token.
+        if: env.PUBLISHED != 'true'
         env:
-          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
-          TOKEN: ${{ secrets.FORGEJO_RELEASE_TOKEN || github.token }}
           TAG: ${{ github.ref_name }}
-          TITLE: ntfy-toast ${{ github.ref_name }}
           NOTES_FILE: notes.md
-        run: bash .forgejo/scripts/forgejo-release.sh dist/ntfy-toast.exe dist/ntfy-toast.exe.sha256
+        run: |
+          TITLE="ntfy-toast $VERSION" \
+            .forgejo/scripts/forgejo-release.sh dist/ntfy-toast.exe dist/ntfy-toast.exe.sha256
       - name: Announce on the release topic
         # Running copies subscribe to this topic and check for the update right away.
         # A failure here doesn't undo the release; copies also check at startup.
+        if: env.PUBLISHED != 'true'
         run: |
-          curl -sS --fail-with-body --max-time 20 -H "Title: ntfy-toast $GITHUB_REF_NAME released" -H "Tags: package" \
+          curl -sS --fail-with-body --max-time 20 -H "Title: ntfy-toast $VERSION released" -H "Tags: package" \
             -d "Install it from the notification, or run: ntfy-toast update" "$RELEASE_TOPIC" \
             || echo "::warning::Couldn't post to $RELEASE_TOPIC; running copies will find the update at their next start."

@@ -4,6 +4,8 @@
 mod action;
 mod config;
 mod daemon;
+#[cfg(test)]
+mod git_version;
 mod message;
 mod paths;
 mod subscriber;
@@ -19,10 +21,13 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+/// The version this exe was built as, worked out from git tags by build.rs.
+pub const VERSION: &str = env!("NTFY_TOAST_VERSION");
+
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 #[derive(Parser)]
-#[command(version, about = "Subscribe to ntfy topics and show them as Windows toast notifications")]
+#[command(version = VERSION, about = "Subscribe to ntfy topics and show them as Windows toast notifications")]
 struct Cli {
     /// Config file [default: %APPDATA%\ntfy-toast\config.toml]
     #[arg(short, long, global = true)]
@@ -218,8 +223,14 @@ fn check_update(cfg: &Config) -> Result<()> {
     let src = updater::Source::from_config(&cfg.update);
     let rel = updater::latest(&subscriber::http(), &cfg.update)?;
     let current = updater::Version::current();
+    let channel = match (cfg.update.channel, &src.list_url) {
+        (config::Channel::Stable, _) => "stable",
+        (config::Channel::Dev, Some(_)) => "dev",
+        (config::Channel::Dev, None) => "stable (channel = \"dev\" needs the Forgejo token)",
+    };
     println!("installed: {current}");
     println!("latest:    {} ({})", rel.version, src.label);
+    println!("channel:   {channel}");
     if rel.version > current {
         println!("Update available: run `ntfy-toast update` or use the notification's Install button.");
     } else {

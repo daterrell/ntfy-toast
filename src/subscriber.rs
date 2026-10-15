@@ -68,7 +68,7 @@ pub fn http() -> Http {
         // Applies to waiting for the response headers and to each read of the stream,
         // not to the whole (endless) response.
         .timeout(READ_TIMEOUT)
-        .user_agent(concat!("ntfy-toast/", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("ntfy-toast/{}", crate::VERSION))
         .build()
         .expect("HTTP client")
 }
